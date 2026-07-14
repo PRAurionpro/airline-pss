@@ -1,0 +1,285 @@
+PSS — Offer Module LLD	Working Draft v0.1
+
+**PASSENGER SERVICE SYSTEM (PSS)**
+
+**Offer Module — Low-Level Design**
+
+*The shopping-to-order seam · composes Inventory + Pricing into a time-bounded offer*
+
+Version 0.1 — Working Draft
+
+Prepared: June 2026
+
+Companion to: SDD (v0.2), Build Plan, Order / Inventory / Pricing / Payments LLDs
+
+**Prepared by Aurionpro Solutions Limited**
+
+**Table of Contents**
+
+# 1. Introduction and Scope
+
+## 1.1 Purpose
+
+This is the low-level design (LLD) for the Offer module — the component that turns a shopping request into a priced, time-bounded proposal the customer can accept. It is the 'offer' in shop → offer → order → pay, and it is deliberately thin: an orchestration and aggregation layer that composes Inventory availability and a Pricing quote into a single offer, rather than a write-heavy domain aggregate. This document takes the Offer concept from the System Design Document down to buildable detail: the domain model, the assembly orchestration, the offer lifecycle and validity, the critical shopping-to-order handoff, the API contract and the persistence design.
+
+## 1.2 Relationship to companion documents
+
+This LLD conforms to the SDD (v0.2) and is sequenced by the Phase 0 & Phase 1 Build Plan. It is the last of the Phase-1 module designs and the one that ties the others together: it calls Inventory (availability) and Pricing (PriceItinerary), and its output is consumed by the Order module's book-pay-fulfil saga. It realises the offer-order paradigm of modern airline retailing — the offer is the unit of shopping; the order is the unit of fulfilment. Decision D8 (Web IBE first) makes the web shopping path its primary consumer; D10 places it on the eventual/derived side of the consistency model (it is not authoritative).
+
+## 1.3 Scope
+
+The full target model is specified; the Phase-1 subset (synchronous air-offer assembly for the Web IBE, filed-fare pricing, basic ancillaries, no personalisation) is in Section 13. Offer personalisation and ranking, dynamic/continuous-pricing offers, rich bundling, and mapping to an external offer-management/NDC layer are designed for but deferred.
+
+## 1.4 Conventions
+
+API and field names are in monospace; example payloads are illustrative. 'O&D' is origin-and-destination; 'POS' is point of sale (country/currency/channel); 'PTC' is a passenger-type code; 'TTL' is time-to-live. An offer's validity is the window during which its price is honoured. Times are UTC.
+
+# 2. Responsibilities and Boundaries
+
+## 2.1 What the Offer module owns
+
+- Assembling offers: orchestrating Inventory and Pricing to compose complete, priced offers in response to a shopping request.
+
+- The Offer itself — an immutable, time-bounded proposal (flights + ancillaries + a total) — and its short-lived store.
+
+- Serving offers by id for the shopping journey, and signalling validity/expiry.
+
+- A pluggable personalisation/ranking hook (a pass-through in Phase 1) for ordering and filtering offers later.
+
+## 2.2 What the Offer module does not own
+
+| **Concern** | **Owner** | **Offer****'****s relationship** |
+| --- | --- | --- |
+| Flights, classes, availability | Inventory / Availability | Queries availability; never decides seats or holds them. |
+| Fares, taxes, the quote | Pricing & Fares | Calls PriceItinerary; carries the resulting PriceQuote; computes no prices. |
+| The order, holds, payment | Order / Inventory / Payments | Hands the offer to Order on accept; holds nothing, charges nothing. |
+| Price/availability validity at accept | Order (re-validation) | Order re-validates the offer before committing (§6). |
+| Customer profile / loyalty data | CRM / Loyalty (later) | Consumed by personalisation when enabled; not stored here. |
+
+## 2.3 The offer is an aggregation layer
+
+Unlike the other Phase-1 modules — each of which owns a heavy aggregate with strong invariants (Inventory's no-oversell, Order's state machine, Payments' PCI isolation) — Offer is a read-path orchestrator. It holds no authoritative state: an offer is a derived projection of Inventory and Pricing at a moment in time. This shapes everything below — it is horizontally scalable, cache-backed, and intentionally disposable.
+
+## 2.4 Dependencies
+
+**Outbound (calls): **Inventory (search availability) and Pricing (PriceItinerary) synchronously during assembly. **Inbound (called by): **the Web IBE / shopping clients (Shop, GetOffer); the Order module (GetOffer at order creation, for re-validation).
+
+# 3. Domain Model
+
+## 3.1 Offer and OfferItem
+
+The model is small. Offer is the root — a priced, time-bounded proposal — composed of OfferItems (the flights and ancillaries). The price comes from a Pricing PriceQuote (referenced, not owned) and the flights come from Inventory availability (referenced, not owned). Keeping those references explicit is what makes the offer auditable and re-validatable later.
+
+*Figure 1 — Offer domain model. The Offer owns its items; availability and the price quote are read-only references to other modules.*
+
+| **Entity** | **Key fields** |
+| --- | --- |
+| Offer (root) | offerId, tenantId, shoppingContext (O&D, passengers, point of sale), createdAt, validUntil, currency, totalAmount, quoteRef (the PriceQuote), status. |
+| OfferItem | itemId, offerId, type {FLIGHT│ANCILLARY}, productRef (flightInventoryId or ancillary code), segments, priceRef (the FareComponent/TaxLine), amount. |
+| PriceQuote (referenced — Pricing) | The immutable, versioned quote the offer's price is taken from; carries its own validUntil. |
+| FlightAvailability (referenced — Inventory) | The flights/classes the offer items were selected from at shopping time. |
+
+# 4. Offer Assembly and Orchestration
+
+Assembling an offer is the module's core job: take a shopping request, gather availability from Inventory, price the selected itinerary with Pricing, and compose the result into one or more offers. It is the aggregation (BFF-style) pattern — one inbound call fanning out to the domain services and folding their results together.
+
+*Figure 2 — Offer assembly. The orchestrator gathers availability, prices the itinerary, and composes a time-bounded offer; no inventory is held.*
+
+| **Step** | **What happens** |
+| --- | --- |
+| **1 Shop** | Client sends a shopping request (O&D, passengers, dates, point of sale). |
+| **2 Availability** | Offer queries Inventory for available flights and classes matching the request. |
+| **3 Price** | Offer calls Pricing (PriceItinerary) for the selected flights/passengers, receiving a PriceQuote. |
+| **4 Compose** | Offer assembles OfferItems + total + currency, inheriting validUntil from the quote. |
+| **5 Return ****&**** cache** | The offer(s) are returned to the client and stored with a TTL equal to validUntil. |
+
+## 4.1 Composition, bundling and ancillaries
+
+In Phase 1 an offer carries the flight(s) and any basic ancillaries (e.g. a bag) as items, each with its own priced amount and a single offer total. The composition is deliberately simple; richer bundling (fare families, packaged ancillaries, cross-sell) is a later extension behind the same Offer/OfferItem shape, so no remodelling is needed to add it.
+
+## 4.2 Partial results and resilience
+
+Because assembly fans out to two services, it handles partial failure explicitly: if Pricing cannot price a candidate, that candidate is dropped rather than failing the whole response; if Inventory returns nothing, the shopping response is simply empty. The orchestrator applies timeouts and returns the best complete set it can, so a slow or partially-degraded dependency degrades breadth of results rather than breaking shopping.
+
+## 4.3 Personalisation hook (later)
+
+Ranking, filtering and personalising the offers returned sits behind a pluggable port (the same pattern used for Pricing's strategy). Phase 1 ships a pass-through (return the assembled offers as-is); a personalisation implementation — using profile/loyalty/context signals — can be slotted in later without changing assembly or the API.
+
+# 5. Offer Lifecycle and Validity
+
+An offer is ephemeral and time-bounded by design. Its lifecycle is light: it is constructed, valid for a short window, and then either accepted (consumed by an order) or expired.
+
+| **State** | **Meaning** |
+| --- | --- |
+| CONSTRUCTED → VALID | Just assembled and cached; honoured until validUntil. |
+| EXPIRED | Past validUntil — the price is stale; the client must re-shop (or the offer be re-priced). |
+| ACCEPTED | An order was created from it (terminal for the offer). |
+
+Two properties matter downstream:
+
+- **Immutable ****&**** derived. **An offer is never edited; it is a snapshot of Inventory + Pricing at assembly time. A change means a new offer.
+
+- **Time-bounded (TTL). **validUntil is inherited from the PriceQuote, and the offer is cached with exactly that TTL — so a stored offer can never outlive its price.
+
+Because the offer is derived and disposable, losing it has no business consequence: the client simply re-shops. This is why it lives in a short-lived store rather than a durable system of record.
+
+# 6. The Shop-to-Order Handoff
+
+The offer is the seam between shopping (derived, time-bounded) and ordering (authoritative, strongly consistent). The single most important design point in this module is what happens at that seam: because an offer is a snapshot that can go stale, the Order module must re-validate it before committing.
+
+*Figure 3 — The offer sits between derived shopping and authoritative ordering; the Order re-validates at the seam.*
+
+When the customer selects an offer, Order.CreateOrder is called with the offerId. The Order then:
+
+- Fetches the offer (GetOffer) and checks it is still VALID.
+
+- Re-validates the price — if the offer has expired, it re-prices via Pricing (a fresh quote) and surfaces any difference before proceeding.
+
+- Confirms inventory is still available and places the hold (Inventory) — the first point at which anything is reserved.
+
+- Proceeds with the book-pay-fulfil saga (Order/Payments).
+
+This division of labour is deliberate: Offer stays cheap, stateless and fast on the shopping path, while the authoritative checks (does the price still hold, is the seat still there) happen once, at order time, on the strongly-consistent side. Offer never holds inventory or takes payment.
+
+# 7. API Contract
+
+Internal platform APIs over the gateway; REST/JSON; tenant from the verified token. Offer operations are read-style: they produce and retrieve offers but reserve nothing.
+
+## 7.1 Shop (create offers)
+
+POST /v1/offers/shop  — assemble offers for a shopping request; returns a set of priced, time-bounded offers.
+
+| *Illustrative* POST /v1/offers/shop { "origin":"BLR", "destination":"BOM", "departureDate":"2026-07-15",   "passengers":[ {"ptc":"ADT","count":1} ],   "pointOfSale":{ "country":"IN","currency":"INR","channel":"WEB" } } 200 OK { "offers":[    { "offerId":"01HO...", "currency":"INR", "totalAmount":5499.00,      "validUntil":"2026-07-01T10:20:00Z", "quoteRef":"01HQ...",      "items":[ {"type":"FLIGHT","productRef":"01HZ...",                  "segments":["BLR-BOM"],"amount":5499.00} ],      "summary":{"departure":"06:10","arrival":"08:05","fareBasis":"BL1XIN"} }    /* ... more offers (other flights / fares) ... */  ] } |
+| --- |
+
+## 7.2 GetOffer
+
+GET /v1/offers/{offerId}  — retrieve an offer by id (used by the client to review, and by Order at creation). 404 if expired/evicted.
+
+| *Illustrative* GET /v1/offers/01HO... 200 OK { "offerId":"01HO...", "status":"VALID", "validUntil":"...Z",   "currency":"INR", "totalAmount":5499.00, "quoteRef":"01HQ...",   "items":[ ... ] } |
+| --- |
+
+## 7.3 Error model
+
+| **HTTP** | **Condition** |
+| --- | --- |
+| 400 / 401 / 403 | Validation, authorisation or tenant-context failure. |
+| 404 Not Found | Offer not visible to the tenant, or expired and evicted from the store. |
+| 410 Gone | Offer found but past validUntil (client should re-shop). |
+| 502 / 503 | Inventory or Pricing unavailable; shopping degraded or unavailable (retry). |
+
+# 8. Domain Events
+
+Offer is a synchronous, request-response module, so its eventing is minimal — it is not an event-driven aggregate like Order or Inventory.
+
+## 8.1 Published (optional)
+
+| **Event** | **Emitted when** | **Purpose** |
+| --- | --- | --- |
+| OfferCreated | An offer is assembled | Analytics / shopping funnel metrics (non-critical). |
+
+## 8.2 Consumed (later)
+
+In Phase 1 the module reads Inventory and Pricing synchronously and consumes no events. Later, it may consume availability- and fare-change signals (ScheduleChanged, FareUpdated) to proactively invalidate or refresh cached offers ahead of their TTL — an optimisation, not a correctness requirement, since the Order re-validation seam already guards against staleness.
+
+# 9. Interaction with Inventory, Pricing and Order
+
+| **Party** | **Direction** | **Why** |
+| --- | --- | --- |
+| Inventory / Availability | Offer → Inventory | Search available flights/classes for the shopping request. |
+| Pricing & Fares | Offer → Pricing | PriceItinerary the selected flights → PriceQuote carried on the offer. |
+| Order Management | Order → Offer | GetOffer at CreateOrder; the offer is the input to the order, then re-validated. |
+
+Offer holds no order, inventory or payment state; it is a deterministic composition over two read sources. This keeps it horizontally scalable and easy to reason about — and makes the Order the single authoritative gate before anything is reserved or charged.
+
+# 10. Persistence and Data Design
+
+## 10.1 A short-lived offer store
+
+Offers live in a short-lived, TTL-based store (a cache-style store such as an in-memory/Redis tier or a TTL table), keyed by offerId and scoped by tenant. Each offer is written with a TTL equal to its validUntil, so expiry is automatic and a stored offer can never outlive its price. The store is not a system of record — it can be lost and rebuilt by re-shopping — which is why it is optimised for fast reads rather than durability.
+
+| **Store** | **Holds** |
+| --- | --- |
+| offer_store (TTL) | Assembled offers (items, total, quoteRef, validUntil, status), keyed by offerId, tenant-scoped, expiring at validUntil. |
+
+## 10.2 Consistency, multi-tenancy and recovery
+
+Per D10, Offer sits on the eventual/derived side of the consistency model: an offer is a point-in-time projection that can become stale, and the Order re-validation seam (§6) is the mechanism that reconciles staleness at the authoritative boundary. All offers are tenant-scoped (pooled tier) and resident in the tenant's region (India first). Recovery is trivial: there is nothing durable to restore — clients re-shop, and offers are re-assembled on demand.
+
+# 11. Cross-Cutting Concerns
+
+- **Derived, not authoritative. **Offer never holds the truth; it composes it. Staleness is expected and handled at the Order seam, not prevented here.
+
+- **Personalisation port. **Ranking/filtering is pluggable (pass-through in Phase 1), so personalised retailing can be added without touching assembly or the API.
+
+- **Observability. **Traced assembly spanning the Inventory and Pricing calls; metrics on shopping latency, offers-per-search, dependency latency/error rates and offer-acceptance rate; an SLO on the Shop path.
+
+- **Multi-tenancy ****&**** config. **Tenant-scoped offers; per-tenant config for offer TTL behaviour, result limits and (later) the personalisation strategy — config-over-code.
+
+# 12. Non-Functional Targets (Offer module)
+
+| **Dimension** | **Target (to ratify)** |
+| --- | --- |
+| **Shopping latency** | Shop p95 on the order of a second (dominated by the Inventory + Pricing calls); GetOffer single-digit-millisecond from the store. |
+| **Throughput ****&**** scale** | High read volume; stateless orchestrator + cache-backed store; scales horizontally with shopping demand. |
+| **Availability** | Shopping-path tier (high availability); degrade gracefully (fewer/no offers) when a dependency is impaired rather than erroring hard. |
+| **Consistency** | Derived/eventual; offers are time-bounded and re-validated by Order — never treated as authoritative. |
+| **Resilience** | Timeouts and partial-result handling on the fan-out; a degraded dependency reduces breadth, not correctness. |
+
+# 13. Phase-1 Scope vs Full Design
+
+| **Built in Phase 1** | **Designed, deferred** |
+| --- | --- |
+| Synchronous air-offer assembly (Web IBE) | Personalisation / ranking engine |
+| Flights + basic ancillaries as offer items | Rich bundling, fare families, packaged cross-sell |
+| Filed-fare pricing via Pricing | Dynamic / continuous-pricing offers (P4) |
+| TTL-based offer store; GetOffer | Proactive cache invalidation from change events |
+| Pass-through personalisation port | Profile/loyalty-driven offer construction |
+| Pooled tenant; INR / India POS | NDC / external offer-management mapping; multi-modal |
+
+# 14. Testing Strategy
+
+- **Assembly orchestration. **Shop fans out to Inventory and Pricing and composes correct offers (items, total, validUntil inherited from the quote).
+
+- **Partial failure. **A Pricing failure for one candidate drops only that candidate; an empty Inventory result yields an empty (not failed) response; dependency timeouts are honoured.
+
+- **Validity / TTL. **Offers expire exactly at validUntil; GetOffer returns 410/404 past expiry; a stored offer never outlives its quote.
+
+- **Handoff / re-validation. **Order consuming a valid offer proceeds; consuming an expired offer triggers re-price; no inventory is held by Offer at any point.
+
+- **Personalisation port. **Pass-through returns assembled offers unchanged; a stub strategy can reorder/filter without changing the contract.
+
+- **Contract ****&**** load. **Consumer-driven contracts with Inventory, Pricing and Order; shopping latency and throughput under search peak.
+
+# 15. Open / Residual Decisions
+
+- Offer store technology (in-memory/Redis vs TTL table) and the default offer validity window (coordinated with the PriceQuote TTL).
+
+- How many offers a single Shop returns and the result-shaping rules (cheapest, fastest, recommended) before a personalisation engine exists.
+
+- Whether Offer exposes a RefreshOffer (re-price in place) convenience, or expiry always forces a re-shop.
+
+- Ancillary scope for Phase 1 offers (which ancillaries are offerable at shopping time vs added during servicing).
+
+- Phase-4 personalisation strategy contract and the profile/loyalty signals it consumes (the port exists from day one).
+
+- Whether to consume change events for proactive cache invalidation, or rely solely on TTL + Order re-validation.
+
+# 16. Appendix
+
+## 16.1 Glossary (delta)
+
+| **Term** | **Meaning** |
+| --- | --- |
+| Offer | A priced, time-bounded proposal (flights + ancillaries) the customer can accept. |
+| Offer item | A line in an offer — a flight or an ancillary — with its own priced amount. |
+| Offer-order paradigm | Modern airline retailing model: the offer is the unit of shopping, the order the unit of fulfilment. |
+| Shopping context | The request an offer was built for: O&D, passengers and point of sale. |
+| validUntil / TTL | The window an offer's price is honoured for; the store evicts the offer at this time. |
+| Re-validation | The Order's check, at accept time, that the offer's price and availability still hold. |
+| Aggregation / BFF | The pattern of one inbound call fanning out to several services and composing their results. |
+| Personalisation port | The pluggable hook for ranking/filtering offers (pass-through in Phase 1). |
+
+*This LLD is a working-draft companion to the SDD (v0.2), the Phase 0 **&** Phase 1 Build Plan, and the Order / Inventory / Pricing / Payments LLDs. Example payloads are illustrative; field-level schemas are defined in the module**'**s OpenAPI / event contracts. With this module, every component of the shop → offer → order → pay path is specified.*
+
+	© 2026 Aurionpro Solutions Limited  ·  Confidential — internal working document	Page  of

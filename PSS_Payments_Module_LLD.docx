@@ -1,0 +1,283 @@
+**PASSENGER SERVICE SYSTEM (PSS)**
+
+**Payments ****&**** Settlement Module — Low-Level Design**
+
+*The money seam of book-pay-fulfil · tokenised, idempotent, reconcilable*
+
+Version 0.1 — Working Draft
+
+Prepared: June 2026
+
+Companion to: SDD (v0.2), Build Plan, Order / Inventory / Pricing / Offer LLDs
+
+**Prepared by Aurionpro Solutions Limited**
+
+**Table of Contents**
+
+# **1. Introduction and Scope**
+
+## **1.1 Purpose**
+
+This is the low-level design (LLD) for the Payments & Settlement module — the component that takes money for an order and gives it back when an order is unwound. It is the ‘pay’ in shop → offer → order → pay, and it is the most safety-critical of the Phase-1 modules: it is the only one that moves real money, and the only one whose mistakes are measured in currency rather than seats. This document takes the Payments concept from the System Design Document down to buildable detail: the PCI boundary, the domain model and payment state machine, the synchronous saga integration, the refund and compensation model, and the ambiguous-outcome resolution that keeps the system from ever charging without booking or booking without charging.
+
+## **1.2 Relationship to companion documents**
+
+This LLD conforms to the SDD (v0.2) and is sequenced by the Phase 0 & Phase 1 Build Plan. It is the last Phase-1 module design and completes the book-pay-fulfil saga that the Order LLD orchestrates: the saga calls this module to settle payment after the inventory hold and to refund it on any downstream failure. Where the SDD describes the full target Payments service (multi-method, multi-currency, fraud, settlement-with-orders, BSP/ARC feeds), this LLD specifies the Phase-1 subset and states precisely what is designed-for but deferred.
+
+## **1.3 Scope**
+
+The full target model is specified at the SDD level; the Phase-1 subset is in Section 12. Phase 1 delivers synchronous single-settle payment against a simulated PSP, idempotent refunds with an honest failure state, tokenised instruments (no PAN in the platform), and the published payment events the downstream financial ecosystem will later consume. Two-phase authorise/capture, real PSP integration, fraud scoring, settlement-with-orders and continuous reconciliation are designed-for and deferred.
+
+## **1.4 Conventions**
+
+Identifiers use ULIDs unless stated. Money is always an amount plus an ISO-4217 currency, represented as exact decimal — never floating point. All times are UTC (ISO-8601). ‘PSP’ is a payment service provider; ‘PAN’ is the primary account number (the card number); ‘PCI scope’ is the cardholder-data environment governed by PCI-DSS. ‘CDE’ is the cardholder-data environment.
+
+# **2. Responsibilities and Boundaries**
+
+## **2.1 What the Payments module owns**
+
+- Orchestrating payment for an order: taking the order total and settling it through a PSP, returning a definitive paid / declined outcome to the saga.
+
+- The PaymentIntent — the authoritative record of an order’s payment attempt — and its child Transactions and Refunds.
+
+- Refund processing: returning money for a cancelled or compensated order, exactly once, with an explicit, observable failure state when a refund cannot be completed.
+
+- Tokenisation boundary: holding instruments only as PSP tokens, so the platform never stores a PAN and stays out of PCI scope.
+
+- Publishing payment lifecycle events (PaymentSettled, PaymentFailed, RefundIssued) for downstream consumers — accounting, settlement, reporting — that arrive in later phases.
+
+## **2.2 What the Payments module does not own**
+
+| **Concern** | **Owner** | **Payments’ relationship** |
+| --- | --- | --- |
+| The order, its items and totals | Order Management | Receives the amount to charge; returns an outcome; never decides what is owed. |
+| The inventory hold | Inventory | Unaware of holds; the saga sequences hold and pay. |
+| The price / quote | Pricing & Fares | Charges the amount the order presents; computes no prices. |
+| Card data (PAN, CVV) | PSP / vault | Never sees or stores a PAN; holds only a PSP token. |
+| Settlement to BSP/ARC, order accounting | Order Accounting / Settlement (P3) | Emits payment events the accounting modules consume later. |
+
+## **2.3 The money boundary**
+
+Unlike the other Phase-1 modules, Payments’ defining property is not an aggregate invariant (oversell, determinism, assembly) but a financial one: every rupee taken must be either delivered against a confirmed order or returned, exactly once, and the system must never be in a state where it has charged a customer for a booking it did not make, or made a booking it did not charge for. Two design choices serve that property above all others — the synchronous, in-saga orchestration that keeps compensation linear (§4), and the ambiguous-outcome resolution that refuses to guess a payment result (§6.4).
+
+## **2.4 Dependencies**
+
+**Outbound (calls): **the PSP (simulated in Phase 1) for settle and refund. **Inbound (called by): **the Order module’s book-pay-fulfil saga (Pay, Refund, GetPaymentStatus), synchronously.
+
+# **3. Domain Model**
+
+## **3.1 PaymentIntent, Transaction and Refund**
+
+The model is small and bounded by one order. PaymentIntent is the aggregate root — one per order’s payment attempt — and the single thing the saga talks to. Transaction and Refund are its children: the durable record of what actually happened at the PSP. SettlementRecord (the fourth SDD entity) belongs to the settlement-with-orders concern and is deferred to Phase 3.
+
+| **Entity** | **Key fields** |
+| --- | --- |
+| PaymentIntent (root) | paymentIntentId, tenantId, orderId, amount, currency, status, pspReference, idempotencyKey, method, createdAt, updatedAt. |
+| Transaction (child) | transactionId, paymentIntentId, type {AUTHORIZE│CAPTURE│SETTLE}, pspRequestRef, pspResponseRef, outcome, amount, occurredAt. |
+| Refund (child) | refundId, paymentIntentId, idempotencyKey (deterministic per triggering saga step), amount, status {PENDING│ISSUED│FAILED}, pspRefundReference, reason, occurredAt. |
+| SettlementRecord (deferred — P3) | BSP/ARC settlement feed; designed-for, not built in Phase 1. |
+
+The pspReference on the intent and the pspRefundReference on each refund are the reconciliation hooks: every money-moving operation records the PSP’s own identifier, so a reconciliation engine can later match platform records against PSP records. Phase 1 records them faithfully; it does not yet reconcile.
+
+## **3.2 The PaymentIntent state machine**
+
+The state machine is two-phase-ready but single-settle in Phase 1. The live Phase-1 path and its transitions:
+
+| **Transition** | **Trigger** | **Meaning** |
+| --- | --- | --- |
+| INITIATED → SETTLED | pay() succeeds | Single-settle: auth and capture happen atomically at the PSP; money has moved. |
+| INITIATED → FAILED | pay() declined | The PSP declined; no money moved; the saga compensates the hold. |
+| SETTLED → REFUND_PENDING | refund() initiated | A downstream failure or a voluntary cancel requires the money back. |
+| REFUND_PENDING → REFUNDED | refund() succeeds at PSP | Money returned; the order-side compensation completes. |
+| REFUND_PENDING → REFUND_FAILED | bounded retries exhausted | Refund could not be completed; money is still owed. Alerts; awaits drain (P2) or manual action. |
+
+Three states exist in the enum but are **not exercised** in Phase 1 — AUTHORIZED, CAPTURED and VOIDED. They are carried so that two-phase authorise/capture (§12) slots in later with no remodel: pay() splits into authorize() → AUTHORIZED and capture() → CAPTURED → SETTLED, with AUTHORIZED → VOIDED as the no-money-moved compensation. Nothing built in Phase 1 changes when they are added.
+
+### **Why REFUND_FAILED is a first-class state**
+
+A failed hold-release has a safety net: the inventory hold TTL expires and the seat returns on its own. A failed refund has no such net — the money stays taken until the refund succeeds. Modelling REFUND_FAILED explicitly, rather than swallowing the failure, is what keeps that condition visible: it alerts, it is queryable, and it is the queue a Phase-2 background drainer (or a human) works. The design refuses to let a failed refund look like a successful one.
+
+# **4. Integration with the Book-Pay-Fulfil Saga**
+
+## **4.1 Synchronous orchestration, not choreography**
+
+The Order saga is an orchestrator: it calls Inventory to hold synchronously, branches on the result, then proceeds. Payments joins the saga the same way. The saga calls Pay() synchronously, receives a definitive settled / declined outcome, and decides the next step — exactly the shape already proven for the inventory hold. This keeps one coordination model across the whole saga and, decisively, keeps compensation linear: when a step after payment fails, the saga is still on the thread that called Pay(), and it calls Refund() right there, in sequence, rather than coordinating an asynchronous refund across event hops.
+
+## **4.2 The happy path**
+
+The Phase-1 saga sequence, with Payments as one orchestrated step:
+
+- HoldInventory (with TTL) → held. (Inventory, already integrated.)
+
+- Pay (single-settle) → SETTLED. (Payments, synchronous.)
+
+- ConfirmHold → confirmed. (Inventory.)
+
+- IssueTicket / EMD → ticketed. (Stubbed in Phase 1.)
+
+- Order → CONFIRMED; PaymentSettled published for downstream consumers.
+
+## **4.3 Compensation**
+
+With single-settle, money moves at Pay, so any failure after Pay triggers a refund. The compensation map:
+
+| **Failure point** | **Compensating action** |
+| --- | --- |
+| Pay declined | Release the inventory hold; order → CANCELLED (reason=payment_failed). No refund (no money moved). |
+| ConfirmHold fails (seat gone) | Refund the payment; order → CANCELLED (reason=inventory_unavailable). |
+| Ticketing / EMD fails | Refund the payment; release the hold; order → CANCELLED; alert. |
+| Voluntary cancel of a confirmed order | Refund the payment per fare rules; order → CANCELLED (reason=customer_request). |
+
+## **4.4 Events for the downstream ecosystem**
+
+The synchronous call is the *command* path — it carries the saga’s control flow. Separately, Payments writes PaymentSettled, PaymentFailed and RefundIssued to its transactional outbox — the *notification* path — for consumers that arrive later (order accounting, settlement, reporting). This mirrors Inventory, which has a synchronous hold API and also publishes events that the saga does not consume. In Phase 1 nothing consumes the payment events; they are published so the ecosystem can be built around them without changing Payments.
+
+# **5. API Contract**
+
+Internal platform APIs; REST/JSON; tenant from the verified token. Operations are state-changing and idempotent (Idempotency-Key).
+
+## **5.1 Operations**
+
+| **Operation** | **Verb / path** | **Purpose** |
+| --- | --- | --- |
+| InitiatePayment (Pay) | POST /v1/payments | Single-settle a payment for an order; returns SETTLED or FAILED. Idempotent per (orderId, Idempotency-Key). |
+| Refund | POST /v1/payments/{id}/refunds | Refund a settled payment; idempotent per the deterministic refund key. Returns REFUNDED, or REFUND_FAILED on exhausted retry. |
+| GetPaymentStatus | GET /v1/payments/{id} | Return the authoritative current state of a payment intent. Used by the saga to resolve an ambiguous Pay outcome. |
+| CapturePayment (deferred) | POST /v1/payments/{id}/capture | Two-phase capture; designed, not built in Phase 1. |
+
+## **5.2 Error model**
+
+| **HTTP** | **Condition** |
+| --- | --- |
+| 400 / 401 / 403 | Validation, authorisation or tenant-context failure. |
+| 402 / 422 | Payment declined by the PSP (insufficient funds, instrument rejected). |
+| 404 | Payment intent not visible to the tenant. |
+| 409 | Conflicting non-idempotent submission (duplicate with a different key). |
+| 502 / 503 | PSP unavailable; the operation is safe to retry with the same Idempotency-Key. |
+
+# **6. Refund and Correctness Model**
+
+This section specifies the properties that make Payments safe with money. They are stricter than the hold/release correctness already built, because the failure cost is asymmetric: a double-hold wastes a seat; a double-refund gives away real money.
+
+## **6.1 Idempotent refund, deterministically keyed**
+
+Every refund carries an idempotency key derived deterministically from the triggering saga step (per paymentIntentId and the compensation cause) — never a fresh UUID per attempt. Payments stores refunds under that key, so a replayed Refund command returns the existing refund rather than issuing a second. This is the same idempotency discipline as the inventory hold, with stricter stakes.
+
+## **6.2 Bounded retry and the honest failure state**
+
+A Refund call to the PSP can itself fail transiently. With no TTL safety net, a refund that does not immediately succeed must not be dropped. Phase 1 uses a bounded synchronous retry with backoff; a refund that exhausts its retries lands in REFUND_FAILED, emits an alert and increments a metric — the same observability-not-silence principle applied to the inventory release failure. The durable background-retry drainer that empties the REFUND_FAILED queue is Phase 2.
+
+## **6.3 Reconciliation — designed-for, deferred**
+
+Continuous reconciliation (matching platform records against PSP records to catch drift) is essential in production and out of Phase 1. The hook that makes it possible later — every payment and refund recording the PSP’s own reference — is built now; the reconciliation engine is deferred. Against a simulated PSP that cannot drift, building it now would prove nothing.
+
+## **6.4 Ambiguous-outcome resolution — the most important property**
+
+The single most dangerous failure in any payment system is the **ambiguous outcome**: Pay() times out, so the saga does not know whether the PSP charged the customer. Assuming failure and compensating could cancel an order the customer paid for; assuming success could confirm an order that was never charged. Phase 1 resolves this explicitly and from day one: on any ambiguous Pay() result (timeout, unknown), the saga does *not* assume an outcome — it calls GetPaymentStatus to read the authoritative state at the PSP, and only then decides whether to proceed or compensate. This is why GetPaymentStatus exists in the contract, and why it is built in Phase 1 rather than deferred.
+
+# **7. PCI Boundary and Security**
+
+## **7.1 No PAN in the platform**
+
+The platform never stores, logs or transmits a PAN. Card capture and tokenisation happen at the PSP (or a PSP-hosted field); the platform receives only a token. The PaymentIntent holds a PSP token reference, never card data. This keeps the core platform out of PCI scope: the cardholder-data environment is the PSP’s, not ours.
+
+## **7.2 The Phase-1 simulated PSP**
+
+Phase 1 does not charge real cards. A simulated PSP, behind a PaymentProviderPort, behaves like a real one — it tokenises, settles, can decline, can fail transiently, and issues refunds — so the saga’s money-paths are exercised realistically without money moving. The port boundary is what lets a real PSP (and a sandbox, then production) replace the simulator later with no change to the saga or the domain.
+
+## **7.3 Cross-cutting**
+
+- Idempotency & retries: all state-changing operations are idempotent (Idempotency-Key); transient PSP failures are retried with backoff.
+
+- Observability: every payment and refund is traced (correlation/causation ids); metrics on settle/decline/refund rates and a REFUND_FAILED gauge; an SLO on the pay path.
+
+- Strong consistency: the PaymentIntent and its children are written transactionally; the outbox publishes events atomically with state.
+
+- Multi-tenancy: every record is tenant-scoped (pooled tier); India / INR first.
+
+# **8. Domain Events**
+
+Payments publishes to its transactional outbox for downstream consumers; in Phase 1 it consumes none for control flow.
+
+| **Event** | **Emitted when** | **Purpose** |
+| --- | --- | --- |
+| PaymentSettled | A payment reaches SETTLED | Accounting, settlement, reporting (downstream, later). |
+| PaymentFailed | A payment is declined | Funnel metrics, retry analytics. |
+| RefundIssued | A refund reaches REFUNDED | Accounting and settlement reversal (downstream, later). |
+
+Keying follows the platform envelope; payment events are keyed by paymentIntentId (with orderId in the payload) so a consumer can correlate to the order. Self-description holds: the identifiers live in the payload, not only in the key.
+
+# **9. Persistence and Data Design**
+
+A strongly-consistent relational store (Postgres) holds the PaymentIntent and its children — financial records demand durability and exact decimal arithmetic, not a cache. Tables: payment_intents, transactions, refunds, payment_events_outbox; Flyway migrations; the shared transactional-outbox pattern from the paved road. Money is stored as exact decimal with an explicit ISO-4217 currency, never floating point. All rows are tenant-scoped. Recovery target is RPO ≈ 0 for settled payments — a committed financial record must not be lost.
+
+# **10. Non-Functional Targets**
+
+| **Dimension** | **Target (to ratify)** |
+| --- | --- |
+| Availability | Critical-path tier (≥ 99.95%) — Payments is on the booking path; a payment outage stops bookings. |
+| Latency | Pay p95 dominated by PSP authorisation; the saga budgets payment as a synchronous external wait, excluded from CreateOrder’s own budget. |
+| Consistency | Strong financial consistency; idempotent operations; no double-charge, no double-refund, no missed refund. |
+| Recoverability | RPO ≈ 0 for settled payments (synchronous replication); RTO per the platform DR target. |
+| Auditability | Every payment and refund, and every PSP interaction, recorded with the PSP reference for later reconciliation. |
+
+# **11. Testing Strategy**
+
+- Settle / decline. Pay against the simulated PSP settles a good instrument and declines a bad one; the saga proceeds or compensates correctly.
+
+- Refund correctness. A downstream failure after Pay issues exactly one refund; a replayed Refund (same deterministic key) returns the existing refund, never a second.
+
+- Refund failure. A PSP that fails refund through exhausted retries lands the intent in REFUND_FAILED, alerts, and does not report success.
+
+- Ambiguous outcome. A Pay() timeout triggers GetPaymentStatus, and the saga decides on the true PSP state — proving no charge-without-booking and no booking-without-charge.
+
+- Idempotency. Replayed Pay commands (same Idempotency-Key) settle exactly once.
+
+- End-to-end. Through the offer→order path with real Inventory and Pricing and the real Payments service (simulated PSP): a confirmed booking is paid; a compensated booking is refunded — the full money-path proven on real services.
+
+- Two-phase-ready. The state machine admits authorise/capture without remodelling (a design assertion, verified by the enum and transitions).
+
+# **12. Phase-1 Scope vs Full Design**
+
+| **Built in Phase 1** | **Designed, deferred** |
+| --- | --- |
+| Synchronous single-settle Pay; Refund; GetPaymentStatus | Two-phase authorise / capture / void |
+| Simulated PSP behind PaymentProviderPort | Real PSP / sandbox / production integration; PSP-hosted fields |
+| Idempotent refunds; honest REFUND_FAILED state | Background refund-drainer; dunning |
+| Tokens only; no PAN in the platform (PCI out of scope) | In-house vault; alternative tokenisation |
+| PaymentSettled / PaymentFailed / RefundIssued published | Fraud scoring; risk decisioning |
+| pspReference recorded for later reconciliation | Continuous reconciliation engine; BSP/ARC settlement feeds |
+| INR / India methods (UPI, card, net-banking) linkage; pooled tenant | Multi-currency settlement; settlement-with-orders (P3) |
+
+# **13. Open / Residual Decisions**
+
+- The deterministic refund-key formula (per paymentIntentId + compensation cause vs per saga step id) and its collision properties.
+
+- Default bounded-retry count and backoff for Pay and Refund, and the per-tenant override range.
+
+- When two-phase capture is introduced (P2 vs P3) and the auth-expiry timeout’s relationship to the inventory hold TTL.
+
+- Whether the REFUND_FAILED drainer is a scheduled job, an event consumer, or both, and its alerting SLO.
+
+- Phase-1 method scope: which India methods (UPI / RuPay / net-banking / card) are simulated, and how the simulator models method-specific decline behaviour.
+
+- Whether GetPaymentStatus polls the PSP live or reads the last-known intent state on the ambiguous-outcome path.
+
+# **14. Appendix**
+
+## **14.1 Glossary (delta)**
+
+| **Term** | **Meaning** |
+| --- | --- |
+| PaymentIntent | The authoritative record of an order’s payment attempt; the aggregate root. |
+| Single-settle | Authorise and capture performed atomically in one Pay call (Phase 1). |
+| Two-phase | Separate authorise then capture, with void as the no-money-moved release (deferred). |
+| Ambiguous outcome | A payment whose result is unknown to the caller (timeout); resolved via GetPaymentStatus. |
+| PSP | Payment service provider; simulated in Phase 1, behind PaymentProviderPort. |
+| Tokenisation | Replacing a PAN with a PSP token so the platform holds no card data. |
+| PCI scope / CDE | The cardholder-data environment governed by PCI-DSS; kept off the platform. |
+| REFUND_FAILED | A terminal-pending state where a refund could not be completed and money is still owed. |
+
+*This LLD is a working-draft companion to the System Design Document (v0.2), the Phase 0 **&** Phase 1 Build Plan, and the Order / Inventory / Pricing / Offer LLDs. Example payloads are illustrative; field-level schemas are defined in the module’s OpenAPI / event contracts. With this module, every component of the shop → offer → order → pay path is specified — the walking skeleton is complete.*
+
+© 2026 Aurionpro Solutions Limited  ·  Confidential — internal working document  ·  Page

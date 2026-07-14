@@ -1,0 +1,247 @@
+openapi: 3.0.3
+info:
+  title: PSS Offer Module API
+  version: "1.0.0-draft"
+  description: >
+    API for the Offer module of the Aurionpro PSS platform. Offer composes Inventory
+    availability and a Pricing quote into a priced, time-bounded proposal — the unit of
+    shopping in the offer-order paradigm. This contract realises the operations in the
+    Offer Module Low-Level Design (§7).
+
+    Conventions:
+      * Tenant context is derived from the verified bearer token (tenant claim); there is
+        no tenant path/query parameter. A request without tenant context is rejected.
+      * Operations are read-style: they produce and retrieve offers but reserve nothing and
+        need no Idempotency-Key. No inventory is held at shopping time.
+      * An offer is immutable and time-bounded; once past validUntil it is gone (410).
+        The Order module re-validates an offer at accept time.
+      * Errors use the problem+json model (RFC 9457).
+
+    Provisional choices pending residual decisions (Offer LLD §15): offer validity window,
+    number of offers returned, RefreshOffer convenience. These are marked PROVISIONAL.
+  contact:
+    name: Aurionpro Solutions Limited — PSS Platform
+    url: https://www.aurionpro.com
+
+servers:
+  - url: https://{host}
+    description: Gateway base URL (region-specific; India regions first)
+    variables:
+      host:
+        default: api.pss.local
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Offers
+    description: Shop for and retrieve time-bounded offers.
+
+paths:
+  /v1/offers/shop:
+    post:
+      tags: [Offers]
+      operationId: shop
+      summary: Assemble offers for a shopping request
+      description: >
+        Fans out to Inventory (availability) and Pricing (PriceItinerary) and composes one
+        or more priced, time-bounded offers. Holds no inventory. A degraded dependency
+        reduces the breadth of results rather than failing the request.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ShopRequest'
+            examples:
+              one-way-one-adult:
+                summary: One adult, BLR→BOM, India point of sale
+                value:
+                  origin: BLR
+                  destination: BOM
+                  departureDate: "2026-07-15"
+                  passengers: [{ ptc: ADT, count: 1 }]
+                  pointOfSale: { country: IN, currency: INR, channel: WEB }
+      responses:
+        '200':
+          description: A set of priced, time-bounded offers (possibly empty).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ShopResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /v1/offers/{offerId}:
+    get:
+      tags: [Offers]
+      operationId: getOffer
+      summary: Retrieve an offer by id
+      description: >
+        Returns the offer for review, and is used by the Order module at order creation.
+        Returns 410 if the offer has expired (the client should re-shop).
+      parameters:
+        - $ref: '#/components/parameters/OfferIdPath'
+      responses:
+        '200':
+          description: The offer.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Offer'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '410': { $ref: '#/components/responses/Gone' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >
+        OAuth2/OIDC access token. The tenant is taken from a verified claim in the token;
+        there is no tenant path or query parameter. RBAC/ABAC is enforced per operation.
+
+  parameters:
+    OfferIdPath:
+      name: offerId
+      in: path
+      required: true
+      description: Internal offer identifier (ULID).
+      schema:
+        $ref: '#/components/schemas/Ulid'
+
+  responses:
+    BadRequest:
+      description: Validation failure (malformed shopping request).
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Unauthorized:
+      description: Missing or invalid authorisation / tenant context.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Forbidden:
+      description: Authenticated but not permitted for this operation or tenant.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    NotFound:
+      description: Offer not visible to the tenant, or evicted from the store.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Gone:
+      description: Offer found but past validUntil; the client should re-shop.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    BadGateway:
+      description: Inventory or Pricing returned an error during assembly.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    ServiceUnavailable:
+      description: Shopping temporarily unavailable; safe to retry.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+  schemas:
+    Ulid:
+      type: string
+      description: ULID identifier.
+    Currency:
+      type: string
+      pattern: '^[A-Z]{3}$'
+      description: ISO-4217 currency code.
+    PassengerCount:
+      type: object
+      required: [ptc, count]
+      properties:
+        ptc: { type: string, enum: [ADT, CHD, INF] }
+        count: { type: integer, minimum: 1, maximum: 9 }
+    PointOfSale:
+      type: object
+      required: [country, currency]
+      properties:
+        country: { type: string, description: 'ISO-3166 alpha-2 selling country.' }
+        currency: { $ref: '#/components/schemas/Currency' }
+        channel: { type: string, enum: [WEB, MOBILE, AGENT, API] }
+    ShopRequest:
+      type: object
+      required: [origin, destination, departureDate, passengers, pointOfSale]
+      properties:
+        origin: { type: string, description: 'Origin IATA code.' }
+        destination: { type: string, description: 'Destination IATA code.' }
+        departureDate: { type: string, format: date }
+        returnDate: { type: string, format: date }
+        passengers:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/PassengerCount' }
+        pointOfSale: { $ref: '#/components/schemas/PointOfSale' }
+    OfferItemType:
+      type: string
+      enum: [FLIGHT, ANCILLARY]
+    OfferItem:
+      type: object
+      required: [type, productRef, amount]
+      properties:
+        type: { $ref: '#/components/schemas/OfferItemType' }
+        productRef: { type: string, description: 'flightInventoryId or ancillary code.' }
+        segments:
+          type: array
+          items: { type: string, description: 'O&D the item covers (e.g. BLR-BOM).' }
+        cabin: { type: string, description: 'Cabin of the priced class (e.g. Y); absent for ancillaries.' }
+        rbd: { type: string, description: 'Booking class / RBD of the priced item (e.g. B); absent for ancillaries. Lets the Order module re-quote and hold inventory directly off the offer (LLD §6 handoff).' }
+        amount: { type: number }
+    OfferSummary:
+      type: object
+      description: Display summary for the offer (illustrative shape).
+      properties:
+        departure: { type: string }
+        arrival: { type: string }
+        fareBasis: { type: string }
+    OfferStatus:
+      type: string
+      enum: [VALID, EXPIRED, ACCEPTED]
+    Offer:
+      type: object
+      required: [offerId, currency, totalAmount, validUntil, items]
+      properties:
+        offerId: { $ref: '#/components/schemas/Ulid' }
+        status: { $ref: '#/components/schemas/OfferStatus' }
+        currency: { $ref: '#/components/schemas/Currency' }
+        totalAmount: { type: number }
+        validUntil: { type: string, format: date-time }
+        quoteRef: { $ref: '#/components/schemas/Ulid' }
+        items:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/OfferItem' }
+        summary: { $ref: '#/components/schemas/OfferSummary' }
+    ShopResponse:
+      type: object
+      required: [offers]
+      properties:
+        offers:
+          type: array
+          items: { $ref: '#/components/schemas/Offer' }
+    Problem:
+      type: object
+      description: RFC 9457 problem detail.
+      required: [type, title, status]
+      properties:
+        type: { type: string, format: uri, example: 'https://errors.pss/aurionpro/offer/expired' }
+        title: { type: string, example: Offer expired }
+        status: { type: integer, example: 410 }
+        detail: { type: string, example: This offer is past its validity window; please re-shop. }
+        instance: { type: string, format: uri }
+        code: { type: string, description: 'Stable machine-readable error code.', example: OFFER_EXPIRED }

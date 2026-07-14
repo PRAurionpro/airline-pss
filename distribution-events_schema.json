@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.pss/aurionpro/distribution/distribution-events.schema.json",
+  "title": "Distribution module domain events",
+  "description": "Published domain events for the NDC/B2B Distribution module. Consumers MUST be idempotent on eventId.",
+  "$defs": {
+    "Ulid": {
+      "type": "string",
+      "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+    },
+    "DistributionOrderCreated": {
+      "type": "object",
+      "description": "An NDC OrderCreate succeeded — a seller-originated order is now live in the platform.",
+      "required": ["eventId", "type", "version", "tenantId", "occurredAt", "payload"],
+      "properties": {
+        "eventId":     { "$ref": "#/$defs/Ulid" },
+        "type":        { "const": "DistributionOrderCreated" },
+        "version":     { "const": 1 },
+        "tenantId":    { "type": "string" },
+        "occurredAt":  { "type": "string", "format": "date-time" },
+        "correlationId": { "type": "string" },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["orderRef", "sellerId", "sessionId", "offerId", "totalAmount", "currency"],
+          "properties": {
+            "orderRef":    { "type": "string" },
+            "sellerId":    { "type": "string" },
+            "sessionId":   { "$ref": "#/$defs/Ulid" },
+            "offerId":     { "type": "string" },
+            "totalAmount": { "type": "number", "minimum": 0 },
+            "currency":    { "type": "string", "minLength": 3, "maxLength": 3 },
+            "sellerRef":   { "type": ["string", "null"] }
+          }
+        }
+      }
+    }
+  },
+  "oneOf": [
+    { "$ref": "#/$defs/DistributionOrderCreated" }
+  ]
+}

@@ -1,0 +1,140 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.pss.aurionpro/loyalty/events/v1",
+  "title": "Loyalty domain events",
+  "description": "Published events from loyalty-service via the transactional outbox. Consumers MUST be idempotent on eventId. All events share a common envelope; the type field discriminates the payload.",
+  "$defs": {
+    "Ulid": {
+      "type": "string",
+      "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$",
+      "description": "ULID identifier."
+    },
+    "Tier": {
+      "type": "string",
+      "enum": ["BASE", "SILVER", "GOLD"],
+      "description": "Recognised loyalty tier derived from cumulative qualifying miles."
+    },
+    "EventEnvelope": {
+      "type": "object",
+      "description": "Common envelope carried by every loyalty domain event.",
+      "required": ["eventId", "type", "version", "tenantId", "accountId", "memberId", "occurredAt"],
+      "additionalProperties": false,
+      "properties": {
+        "eventId":       { "$ref": "#/$defs/Ulid", "description": "Unique event identifier; consumers deduplicate on this." },
+        "type":          { "type": "string", "description": "Discriminator constant; one of the four loyalty event types." },
+        "version":       { "type": "string", "const": "1", "description": "Schema version." },
+        "tenantId":      { "type": "string", "description": "Tenant that owns the account." },
+        "accountId":     { "$ref": "#/$defs/Ulid", "description": "LoyaltyAccount identifier." },
+        "memberId":      { "$ref": "#/$defs/Ulid", "description": "Member identifier." },
+        "occurredAt":    { "type": "string", "format": "date-time", "description": "Wall-clock time the event occurred (ledger transaction time)." },
+        "correlationId": { "type": "string", "description": "Propagated from the inbound request / upstream event." },
+        "causationId":   { "type": "string", "description": "eventId of the command or upstream event that caused this one." },
+        "payload":       { "type": "object", "description": "Event-specific payload; discriminated by type." }
+      }
+    },
+    "MilesAccruedPayload": {
+      "type": "object",
+      "description": "Payload for MilesAccrued events.",
+      "required": ["points", "qualifyingMiles", "sourceType", "newBalance", "newQualifyingMiles", "newTier"],
+      "additionalProperties": false,
+      "properties": {
+        "points":             { "type": "integer", "minimum": 0, "description": "Points credited in this transaction." },
+        "qualifyingMiles":    { "type": "integer", "minimum": 0, "description": "Qualifying miles credited in this transaction." },
+        "sourceType":         { "type": "string", "enum": ["ORDER_EVENT", "MANUAL"], "description": "Source of the accrual." },
+        "sourceRef":          { "type": "string", "description": "orderId, eventId, or admin reference — by sourceType." },
+        "newBalance":         { "type": "integer", "minimum": 0, "description": "Account pointsBalance after this accrual (post-state)." },
+        "newQualifyingMiles": { "type": "integer", "minimum": 0, "description": "Account qualifyingMiles after this accrual (post-state)." },
+        "newTier":            { "$ref": "#/$defs/Tier", "description": "Account tier after this accrual (post-state; may be unchanged)." }
+      }
+    },
+    "MilesReversedPayload": {
+      "type": "object",
+      "description": "Payload for MilesReversed events.",
+      "required": ["points", "qualifyingMiles", "sourceRef", "newBalance", "newQualifyingMiles", "newTier"],
+      "additionalProperties": false,
+      "properties": {
+        "points":             { "type": "integer", "maximum": 0, "description": "Points reversed (negative integer)." },
+        "qualifyingMiles":    { "type": "integer", "maximum": 0, "description": "Qualifying miles reversed (negative integer)." },
+        "sourceRef":          { "type": "string", "description": "orderId of the cancelled order." },
+        "newBalance":         { "type": "integer", "minimum": 0, "description": "Account pointsBalance after reversal (post-state)." },
+        "newQualifyingMiles": { "type": "integer", "minimum": 0, "description": "Account qualifyingMiles after reversal (post-state)." },
+        "newTier":            { "$ref": "#/$defs/Tier", "description": "Account tier after reversal (post-state; may have stepped down)." }
+      }
+    },
+    "MilesRedeemedPayload": {
+      "type": "object",
+      "description": "Payload for MilesRedeemed events.",
+      "required": ["pointsDebited", "optionId", "voucherRef", "newBalance", "newTier"],
+      "additionalProperties": false,
+      "properties": {
+        "pointsDebited": { "type": "integer", "minimum": 1, "description": "Points debited from the account." },
+        "optionId":      { "$ref": "#/$defs/Ulid", "description": "RedemptionOption that was redeemed." },
+        "voucherRef":    { "type": "string", "description": "Award voucher reference issued by RedemptionFulfilmentPort." },
+        "fulfilmentRef": { "type": "string", "description": "Optional reference from the fulfilment port (stub in this slice)." },
+        "newBalance":    { "type": "integer", "minimum": 0, "description": "Account pointsBalance after redemption (post-state)." },
+        "newTier":       { "$ref": "#/$defs/Tier", "description": "Account tier after redemption (post-state; typically unchanged)." }
+      }
+    },
+    "TierChangedPayload": {
+      "type": "object",
+      "description": "Payload for TierChanged events. Published whenever a tier crossing occurs (up or down).",
+      "required": ["fromTier", "toTier", "qualifyingMilesAtChange"],
+      "additionalProperties": false,
+      "properties": {
+        "fromTier":                { "$ref": "#/$defs/Tier", "description": "Tier before the crossing." },
+        "toTier":                  { "$ref": "#/$defs/Tier", "description": "Tier after the crossing." },
+        "qualifyingMilesAtChange": { "type": "integer", "minimum": 0, "description": "Cumulative qualifying miles at the moment of tier change." }
+      }
+    }
+  },
+  "oneOf": [
+    {
+      "allOf": [
+        { "$ref": "#/$defs/EventEnvelope" },
+        {
+          "properties": {
+            "type":    { "const": "MilesAccrued" },
+            "payload": { "$ref": "#/$defs/MilesAccruedPayload" }
+          },
+          "required": ["payload"]
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/$defs/EventEnvelope" },
+        {
+          "properties": {
+            "type":    { "const": "MilesReversed" },
+            "payload": { "$ref": "#/$defs/MilesReversedPayload" }
+          },
+          "required": ["payload"]
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/$defs/EventEnvelope" },
+        {
+          "properties": {
+            "type":    { "const": "MilesRedeemed" },
+            "payload": { "$ref": "#/$defs/MilesRedeemedPayload" }
+          },
+          "required": ["payload"]
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/$defs/EventEnvelope" },
+        {
+          "properties": {
+            "type":    { "const": "TierChanged" },
+            "payload": { "$ref": "#/$defs/TierChangedPayload" }
+          },
+          "required": ["payload"]
+        }
+      ]
+    }
+  ]
+}

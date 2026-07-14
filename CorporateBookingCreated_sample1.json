@@ -1,0 +1,18 @@
+{
+  "eventId": "01J9ZX8N4S0A1B2C3D4E5F6G7H",
+  "type": "CorporateBookingCreated",
+  "version": 1,
+  "tenantId": "airline-6E",
+  "occurredAt": "2026-07-02T09:15:30.123Z",
+  "payload": {
+    "bookingId": "01J9ZX8N4S0K7M8N9P0Q1R2S3T",
+    "accountId": "01J9ZX8N4S0V4W5X6Y7Z8A9B0C",
+    "travellerId": "01J9ZX8N4S0D1E2F3G4H5J6K7M",
+    "costCentreCode": "ENG",
+    "orderRef": "ORD-7K3M9P",
+    "totalAmount": 12450.00,
+    "currency": "INR",
+    "policyStatus": "COMPLIANT",
+    "sellerRef": "CORP-01J9ZX8N4S0V4W5X6Y7Z8A9B0C-CC-ENG"
+  }
+}

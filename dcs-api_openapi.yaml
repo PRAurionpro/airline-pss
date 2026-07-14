@@ -1,0 +1,790 @@
+openapi: 3.0.3
+info:
+  title: PSS Delivery / DCS Module API
+  version: "0.1.0-draft"
+  description: >
+    Airport-facing Departure Control API for the Aurionpro PSS platform.
+    This contract realises the Delivery/DCS module as specified in the
+    System Design Document (§5.2) and DCS_DELTA_0_3_CHECKIN_BOARDING.md.
+
+    This tranche is the thin walking-skeleton slice: check-in a confirmed
+    order, assign a physical seat, issue a boarding pass, board the passenger,
+    close the flight. Weight & Balance and government-data integrations are
+    stubbed behind ports in this slice; the API surface is the full design.
+
+    Conventions (carried from the platform):
+      * Tenant context is derived from the verified bearer token (tenant claim);
+        there is no tenant path/query parameter.
+      * Every state-changing operation requires an Idempotency-Key header;
+        a repeated key returns the original result rather than acting twice.
+      * Errors use the problem+json model (RFC 9457).
+      * Identifiers are ULIDs unless noted.
+
+    Seat-ownership invariant (SDD §5.2, Inventory LLD §2.2):
+      Inventory counts seats; DCS assigns the specific physical seat.
+      DCS never calls Inventory write paths. The paid seat claim from
+      Tranche 1 ancillaries is honoured as a preference input only.
+
+    Highest availability tier (SDD §11):
+      Check-in/DCS is a flight-grounding path; ≥99.95% availability target;
+      strong consistency for seat and boarding state.
+  contact:
+    name: Aurionpro Solutions Limited — PSS Platform
+    url: https://www.aurionpro.com
+
+servers:
+  - url: https://{host}
+    description: Gateway base URL (region-specific; India regions first)
+    variables:
+      host:
+        default: api.pss.local
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Departures
+    description: Flight departure lifecycle — open, manage, close.
+  - name: CheckIns
+    description: Passenger check-in, seat assignment, boarding passes, boarding.
+
+paths:
+
+  # ── Departures ────────────────────────────────────────────────────────────
+
+  /v1/departures:
+    post:
+      tags: [Departures]
+      operationId: openFlight
+      summary: Open a flight for departure processing
+      description: >
+        Seeds a FlightDeparture record from a scheduled flight reference and
+        the associated Fleet/Cabin cabin map. Idempotent on flightRef within
+        a tenant — repeated calls with the same flightRef return the existing
+        departure. Transitions the departure to OPEN_FOR_CHECKIN.
+
+        G0 gate operation: the departure store + FlightDeparture state machine
+        is proven by this call succeeding against the demo BLR→BOM flight.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OpenFlightRequest'
+            examples:
+              blr-bom-demo:
+                summary: BLR→BOM demo flight
+                value:
+                  flightRef: "BLR-BOM-20260701-PSS101"
+                  cabinMapRef: "CABMAP_01HZX8N4S0ABC737800"
+                  scheduledDepartureAt: "2026-07-01T06:00:00+05:30"
+      responses:
+        '201':
+          description: Flight departure opened (OPEN_FOR_CHECKIN).
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FlightDeparture'
+        '200':
+          description: Departure already exists for this flightRef (idempotent repeat).
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FlightDeparture'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422':
+          description: >
+            Flight reference not found in Schedule, or cabin map reference not
+            found in Fleet/Cabin config.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              examples:
+                flight-not-found:
+                  value:
+                    type: https://errors.pss/aurionpro/dcs/unprocessable
+                    title: Flight reference not found
+                    status: 422
+                    code: FLIGHT_REF_NOT_FOUND
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /v1/departures/{departureId}:
+    get:
+      tags: [Departures]
+      operationId: getDeparture
+      summary: Read departure state, roster, occupancy and boarding progress
+      description: >
+        Returns the full departure read model: flight details, current state,
+        passenger roster (check-ins + assignments + boarding status), and
+        seat-map occupancy. Used by the agent view and, later, the dashboard
+        "flown" beat. Strong-consistency read.
+      parameters:
+        - $ref: '#/components/parameters/DepartureIdPath'
+      responses:
+        '200':
+          description: Departure read model.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FlightDeparture'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/departures/{departureId}/boarding:
+    put:
+      tags: [Departures]
+      operationId: openBoarding
+      summary: Transition departure to BOARDING state
+      description: >
+        Moves the departure from OPEN_FOR_CHECKIN to BOARDING, enabling
+        BoardPassenger calls. Requires an Idempotency-Key. Idempotent:
+        if already BOARDING, returns 200.
+      parameters:
+        - $ref: '#/components/parameters/DepartureIdPath'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+        - $ref: '#/components/parameters/IfMatchHeader'
+      responses:
+        '200':
+          description: Departure is now BOARDING (or was already BOARDING).
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FlightDeparture'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Stale ETag or departure already CLOSED.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              examples:
+                already-closed:
+                  value:
+                    type: https://errors.pss/aurionpro/dcs/conflict
+                    title: Flight already closed
+                    status: 409
+                    code: FLIGHT_ALREADY_CLOSED
+
+  /v1/departures/{departureId}/close:
+    post:
+      tags: [Departures]
+      operationId: closeFlight
+      summary: Close the flight — publishes FlightClosed exactly once
+      description: >
+        Transitions BOARDING → CLOSED. Before closing, calls WeightBalancePort
+        for a final load acknowledgement (stubbed in this tranche). If the port
+        returns NOT_READY, the close is hard-blocked with WB_NOT_READY. Publishes
+        FlightClosed exactly once via the transactional outbox; subsequent calls
+        return the existing CLOSED departure (idempotent).
+
+        This is the G4 headline gate operation: FlightClosed triggers Order's
+        dormant ServiceDelivery consumer, driving confirmed orders toward FULFILLED.
+      parameters:
+        - $ref: '#/components/parameters/DepartureIdPath'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+        - $ref: '#/components/parameters/IfMatchHeader'
+      responses:
+        '200':
+          description: Flight closed. FlightClosed published (or was already CLOSED).
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FlightDeparture'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Stale ETag or not in BOARDING state.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '422':
+          description: >
+            WeightBalancePort returned NOT_READY — close is hard-blocked.
+            Resolve the W&B issue and retry.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              examples:
+                wb-not-ready:
+                  value:
+                    type: https://errors.pss/aurionpro/dcs/unprocessable
+                    title: Weight and balance not ready
+                    status: 422
+                    code: WB_NOT_READY
+                    detail: WeightBalancePort returned NOT_READY. Resolve load issue before closing.
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  # ── Check-ins ─────────────────────────────────────────────────────────────
+
+  /v1/departures/{departureId}/checkins:
+    post:
+      tags: [CheckIns]
+      operationId: checkIn
+      summary: Check in a passenger against a confirmed order
+      description: >
+        Validates that the referenced order is CONFIRMED and the segment matches
+        this departure. Calls GovDataPort (stubbed in this tranche) to check
+        admissibility — GOVDATA_REFUSED hard-blocks the check-in. Creates a
+        CheckIn record in CHECKED_IN state and publishes PassengerCheckedIn.
+
+        Idempotent on (departureId, orderRef, paxRef): a repeated call returns
+        the existing CheckIn.
+      parameters:
+        - $ref: '#/components/parameters/DepartureIdPath'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CheckInRequest'
+            examples:
+              single-pax:
+                summary: Check in passenger P1 on order ORD_01HZX…
+                value:
+                  orderRef: "ORD_01HZX8N2QE00000000000000"
+                  paxRef: "P1"
+                  segmentRef: "SEG_BLR_BOM_01"
+      responses:
+        '201':
+          description: Passenger checked in. PassengerCheckedIn published.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CheckIn'
+        '200':
+          description: Already checked in (idempotent repeat).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CheckIn'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422':
+          description: >
+            Check-in not possible: order not CONFIRMED, segment mismatch,
+            flight not OPEN_FOR_CHECKIN, or admissibility refused by GovDataPort.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              examples:
+                order-not-checkinable:
+                  value:
+                    type: https://errors.pss/aurionpro/dcs/unprocessable
+                    title: Order not checkinable
+                    status: 422
+                    code: ORDER_NOT_CHECKINABLE
+                    detail: Order is not CONFIRMED, segment does not match, or has already been flown.
+                flight-not-open:
+                  value:
+                    type: https://errors.pss/aurionpro/dcs/unprocessable
+                    title: Flight not open for check-in
+                    status: 422
+                    code: FLIGHT_NOT_OPEN
+                govdata-refused:
+                  value:
+                    type: https://errors.pss/aurionpro/dcs/unprocessable
+                    title: Admissibility refused
+                    status: 422
+                    code: GOVDATA_REFUSED
+                    detail: GovDataPort returned REFUSED for this passenger/segment combination.
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /v1/checkins/{checkInId}/seat:
+    post:
+      tags: [CheckIns]
+      operationId: assignSeat
+      summary: Assign a physical seat to a checked-in passenger
+      description: >
+        Assigns a specific seat (e.g. 12A) to the check-in. Assignment priority:
+          1. PAID_CLAIM — if the order contains a seat ancillary for this
+             (pax, segment), that seat is honoured as the first preference.
+          2. AGENT — caller explicitly requests a specific seat.
+          3. AUTO — system assigns a free seat using forward-fill.
+
+        Enforces the core DCS invariant: at most one live SeatAssignment per
+        (departureId, seatNumber). Concurrent races → exactly one wins,
+        the loser receives 409 SEAT_TAKEN. This is never relaxed.
+      parameters:
+        - $ref: '#/components/parameters/CheckInIdPath'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AssignSeatRequest'
+            examples:
+              honour-paid-claim:
+                summary: Let DCS honour the paid seat claim
+                value:
+                  source: PAID_CLAIM
+              agent-pick:
+                summary: Agent picks seat 12A explicitly
+                value:
+                  source: AGENT
+                  seatNumber: "12A"
+              auto-assign:
+                summary: Auto-assign a free seat
+                value:
+                  source: AUTO
+      responses:
+        '201':
+          description: Seat assigned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SeatAssignment'
+        '200':
+          description: Already assigned (idempotent repeat with same seat).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SeatAssignment'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: >
+            The requested seat is already assigned to another passenger
+            on this departure. The DCS invariant: one seat, one passenger.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              examples:
+                seat-taken:
+                  value:
+                    type: https://errors.pss/aurionpro/dcs/conflict
+                    title: Seat already assigned
+                    status: 409
+                    code: SEAT_TAKEN
+                    detail: "Seat 12A is already assigned on this departure."
+        '422':
+          description: Seat number not in the cabin map for this departure.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              examples:
+                seat-not-on-map:
+                  value:
+                    type: https://errors.pss/aurionpro/dcs/unprocessable
+                    title: Seat not on cabin map
+                    status: 422
+                    code: SEAT_NOT_ON_MAP
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /v1/checkins/{checkInId}/boardingpass:
+    post:
+      tags: [CheckIns]
+      operationId: issueBoardingPass
+      summary: Issue a boarding pass for a seated checked-in passenger
+      description: >
+        Requires: CheckIn is CHECKED_IN and a SeatAssignment exists. Allocates
+        a monotonic sequence number for this departure and generates a stub
+        barcode reference (real barcode generation is a later tranche). Publishes
+        BoardingPassIssued. Idempotent: repeated call returns the existing pass.
+      parameters:
+        - $ref: '#/components/parameters/CheckInIdPath'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      responses:
+        '201':
+          description: Boarding pass issued. BoardingPassIssued published.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BoardingPass'
+        '200':
+          description: Boarding pass already issued (idempotent repeat).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BoardingPass'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422':
+          description: No seat assignment exists for this check-in yet.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              examples:
+                no-seat:
+                  value:
+                    type: https://errors.pss/aurionpro/dcs/unprocessable
+                    title: Seat assignment required before issuing boarding pass
+                    status: 422
+                    code: SEAT_ASSIGNMENT_REQUIRED
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /v1/checkins/{checkInId}/bags:
+    post:
+      tags: [CheckIns]
+      operationId: acceptBag
+      summary: Accept a checked bag against the check-in
+      description: >
+        Thin bag acceptance: records a BagAccepted event and ties the bag to the
+        Tranche 1 bag ancillary sold on the order (if present). Calls
+        WeightBalancePort (stubbed) to record bag weight against the manifest.
+        Real baggage tracking, tags, and reconciliation are deferred to a later
+        DCS tranche. Idempotent on (checkInId, bagTagRef).
+      parameters:
+        - $ref: '#/components/parameters/CheckInIdPath'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AcceptBagRequest'
+            examples:
+              standard-bag:
+                summary: One 15kg bag tied to sold ancillary
+                value:
+                  bagTagRef: "BSP-TAG-00123456"
+                  weightKg: 14.2
+                  ancillaryRef: "ANX_01HZX8N2QE00000000000001"
+      responses:
+        '201':
+          description: Bag accepted. BagAccepted published.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BagAcceptance'
+        '200':
+          description: Already accepted (idempotent repeat on bagTagRef).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BagAcceptance'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /v1/checkins/{checkInId}/board:
+    post:
+      tags: [CheckIns]
+      operationId: boardPassenger
+      summary: Board a passenger — scan boarding pass at gate
+      description: >
+        Requires: departure is BOARDING and the check-in has an issued boarding
+        pass. Transitions CheckIn CHECKED_IN → BOARDED. Publishes PassengerBoarded.
+        Idempotent: a repeated call on an already-BOARDED check-in returns 200.
+      parameters:
+        - $ref: '#/components/parameters/CheckInIdPath'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      responses:
+        '200':
+          description: Passenger boarded (or was already BOARDED). PassengerBoarded published.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CheckIn'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422':
+          description: Departure not in BOARDING state, or boarding pass not yet issued.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              examples:
+                not-boarding:
+                  value:
+                    type: https://errors.pss/aurionpro/dcs/unprocessable
+                    title: Departure not in BOARDING state
+                    status: 422
+                    code: FLIGHT_NOT_OPEN
+                no-pass:
+                  value:
+                    type: https://errors.pss/aurionpro/dcs/unprocessable
+                    title: Boarding pass not issued
+                    status: 422
+                    code: BOARDING_PASS_REQUIRED
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+# ── Components ───────────────────────────────────────────────────────────────
+
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >
+        OAuth2/OIDC access token. The tenant is taken from a verified claim in
+        the token; there is no tenant path or query parameter. RBAC/ABAC is
+        enforced per operation (agent roles for check-in/boarding; supervisor
+        for close).
+
+  parameters:
+    DepartureIdPath:
+      name: departureId
+      in: path
+      required: true
+      description: Departure identifier (ULID).
+      schema:
+        $ref: '#/components/schemas/Ulid'
+    CheckInIdPath:
+      name: checkInId
+      in: path
+      required: true
+      description: Check-in identifier (ULID).
+      schema:
+        $ref: '#/components/schemas/Ulid'
+    IdempotencyKeyHeader:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Client-generated key making the operation safe to retry.
+      schema: { type: string, minLength: 8, maxLength: 64 }
+    IfMatchHeader:
+      name: If-Match
+      in: header
+      required: true
+      description: Current ETag (departure version) for optimistic concurrency.
+      schema: { type: string }
+
+  headers:
+    ETag:
+      description: The departure version, used as the optimistic-concurrency token.
+      schema: { type: string }
+
+  responses:
+    BadRequest:
+      description: Malformed payload or missing required field.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Unauthorized:
+      description: Missing or invalid authorisation / tenant context.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Forbidden:
+      description: Authenticated but not permitted for this operation or tenant.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    NotFound:
+      description: Departure or check-in not visible to the tenant.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    ServiceUnavailable:
+      description: Transient downstream failure; safe to retry with the same Idempotency-Key.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+  schemas:
+
+    Ulid:
+      type: string
+      description: ULID identifier.
+      pattern: '^[0-9A-HJKMNP-TV-Z]{26}$'
+      example: 01HZX8N4S0ABCDEFGHJKMNPQRS
+
+    Problem:
+      type: object
+      description: RFC 9457 problem detail.
+      required: [type, title, status]
+      properties:
+        type:  { type: string, format: uri, example: 'https://errors.pss/aurionpro/dcs/conflict' }
+        title: { type: string, example: Seat already assigned }
+        status: { type: integer, example: 409 }
+        detail: { type: string, example: Seat 12A is already assigned on this departure. }
+        instance: { type: string, format: uri }
+        code: { type: string, description: Stable machine-readable error code., example: SEAT_TAKEN }
+
+    FlightDepartureState:
+      type: string
+      enum: [SCHEDULED, OPEN_FOR_CHECKIN, BOARDING, CLOSED]
+      description: >
+        FlightDeparture state machine:
+          SCHEDULED        — seeded, not yet open.
+          OPEN_FOR_CHECKIN — check-in and seat assignment active.
+          BOARDING         — boarding passes scannable; PassengerBoarded events flow.
+          CLOSED           — flight closed; FlightClosed published exactly once.
+
+    CheckInState:
+      type: string
+      enum: [PENDING, CHECKED_IN, BOARDED, CANCELLED]
+      description: >
+        CheckIn state machine:
+          PENDING    — created but not yet processed (internal transitional state).
+          CHECKED_IN — passenger checked in; seat assignable.
+          BOARDED    — passenger at gate, boarding pass scanned.
+          CANCELLED  — agent-reversed before boarding (not yet implemented in thin slice).
+
+    SeatAssignmentSource:
+      type: string
+      enum: [PAID_CLAIM, AGENT, AUTO]
+      description: >
+        How the seat was assigned:
+          PAID_CLAIM — honoured from a Tranche 1 ancillary seat purchase.
+          AGENT      — explicitly chosen by the check-in agent.
+          AUTO       — system forward-fill when no claim or preference.
+
+    FlightDeparture:
+      type: object
+      description: Full departure read model including roster and occupancy.
+      required: [departureId, tenantId, flightRef, cabinMapRef, state, scheduledDepartureAt, openedAt]
+      properties:
+        departureId:          { $ref: '#/components/schemas/Ulid' }
+        tenantId:             { type: string }
+        flightRef:            { type: string, description: Scheduled flight reference from Schedule module. }
+        cabinMapRef:          { type: string, description: Fleet/Cabin cabin map reference. }
+        state:                { $ref: '#/components/schemas/FlightDepartureState' }
+        scheduledDepartureAt: { type: string, format: date-time }
+        openedAt:             { type: string, format: date-time }
+        boardingOpenedAt:
+          type: string
+          format: date-time
+          nullable: true
+        closedAt:
+          type: string
+          format: date-time
+          nullable: true
+        checkins:
+          type: array
+          description: Passenger roster. Present in full on getDeparture; summary on state-changing responses.
+          items:
+            $ref: '#/components/schemas/CheckIn'
+
+    CheckIn:
+      type: object
+      description: A single passenger check-in against a confirmed order.
+      required: [checkInId, departureId, orderRef, paxRef, segmentRef, state, checkedInAt]
+      properties:
+        checkInId:    { $ref: '#/components/schemas/Ulid' }
+        departureId:  { $ref: '#/components/schemas/Ulid' }
+        orderRef:     { type: string, description: The confirmed order reference. }
+        paxRef:       { type: string, description: "Passenger reference within the order (P1, P2, …)." }
+        segmentRef:   { type: string, description: Segment reference within the order. }
+        state:        { $ref: '#/components/schemas/CheckInState' }
+        checkedInAt:  { type: string, format: date-time }
+        seatAssignment:
+          description: Present once AssignSeat has been called. Null until assigned.
+          oneOf:
+            - $ref: '#/components/schemas/SeatAssignment'
+            - type: object
+              nullable: true
+        boardingPass:
+          description: Present once IssueBoardingPass has been called. Null until issued.
+          oneOf:
+            - $ref: '#/components/schemas/BoardingPass'
+            - type: object
+              nullable: true
+
+    SeatAssignment:
+      type: object
+      description: >
+        Physical seat assignment for a check-in. Enforces the DCS invariant:
+        at most one live assignment per (departureId, seatNumber).
+      required: [assignmentId, checkInId, seatNumber, source, assignedAt]
+      properties:
+        assignmentId: { $ref: '#/components/schemas/Ulid' }
+        checkInId:    { $ref: '#/components/schemas/Ulid' }
+        seatNumber:   { type: string, example: "12A", description: Physical seat on the cabin map (e.g. 12A). }
+        source:       { $ref: '#/components/schemas/SeatAssignmentSource' }
+        assignedAt:   { type: string, format: date-time }
+
+    BoardingPass:
+      type: object
+      description: Issued boarding pass. Barcode is a stub reference in this tranche.
+      required: [boardingPassId, checkInId, seatNumber, sequenceNumber, barcodeRef, issuedAt]
+      properties:
+        boardingPassId:  { $ref: '#/components/schemas/Ulid' }
+        checkInId:       { $ref: '#/components/schemas/Ulid' }
+        seatNumber:      { type: string, example: "12A" }
+        sequenceNumber:  { type: integer, description: Monotonic boarding sequence number for this departure., example: 7 }
+        barcodeRef:      { type: string, description: "Stub barcode reference (real barcode generation: later tranche).", example: "STUB-BPBC-01HZX8N4S0" }
+        issuedAt:        { type: string, format: date-time }
+
+    BagAcceptance:
+      type: object
+      description: Thin bag acceptance record. Full baggage tracking is a later tranche.
+      required: [bagAcceptanceId, checkInId, bagTagRef, weightKg, acceptedAt]
+      properties:
+        bagAcceptanceId: { $ref: '#/components/schemas/Ulid' }
+        checkInId:       { $ref: '#/components/schemas/Ulid' }
+        bagTagRef:       { type: string, description: Bag tag reference (BSP or carrier format). }
+        weightKg:        { type: number, minimum: 0, example: 14.2 }
+        ancillaryRef:
+          type: string
+          nullable: true
+          description: "The Tranche 1 bag ancillary this acceptance is tied to (if sold)."
+        acceptedAt:      { type: string, format: date-time }
+
+    OpenFlightRequest:
+      type: object
+      required: [flightRef, cabinMapRef, scheduledDepartureAt]
+      additionalProperties: false
+      properties:
+        flightRef:            { type: string, description: Scheduled flight reference from Schedule module. }
+        cabinMapRef:          { type: string, description: Fleet/Cabin cabin map reference. }
+        scheduledDepartureAt: { type: string, format: date-time }
+
+    CheckInRequest:
+      type: object
+      required: [orderRef, paxRef, segmentRef]
+      additionalProperties: false
+      properties:
+        orderRef:   { type: string, description: The confirmed order reference. }
+        paxRef:     { type: string, description: Passenger reference within the order. }
+        segmentRef: { type: string, description: Segment reference within the order. }
+
+    AssignSeatRequest:
+      type: object
+      required: [source]
+      additionalProperties: false
+      properties:
+        source:     { $ref: '#/components/schemas/SeatAssignmentSource' }
+        seatNumber:
+          type: string
+          description: "Required when source is AGENT. Ignored for PAID_CLAIM and AUTO."
+          example: "12A"
+
+    AcceptBagRequest:
+      type: object
+      required: [bagTagRef, weightKg]
+      additionalProperties: false
+      properties:
+        bagTagRef:    { type: string }
+        weightKg:     { type: number, minimum: 0, example: 14.2 }
+        ancillaryRef:
+          type: string
+          nullable: true
+          description: "Tranche 1 bag ancillary reference if tied to a sold bag."

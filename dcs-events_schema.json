@@ -1,0 +1,172 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.pss/aurionpro/dcs/dcs-events.schema.json",
+  "title": "DCS module domain events",
+  "description": "Published domain events for the Delivery/DCS module (DCS_DELTA_0_3_CHECKIN_BOARDING §3 + §9). Every event shares the common envelope; the concrete event is selected by the 'type' constant. Consumers MUST be idempotent on eventId. These five events are the delivery seam the Order module has always declared it consumes (Order LLD §6.3) — this schema is what makes them real.",
+  "$defs": {
+    "Ulid": {
+      "type": "string",
+      "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$",
+      "description": "ULID identifier."
+    },
+    "SeatAssignmentSource": {
+      "type": "string",
+      "enum": ["PAID_CLAIM", "AGENT", "AUTO"],
+      "description": "How the seat was assigned."
+    },
+    "PassengerCheckedIn": {
+      "type": "object",
+      "description": "A passenger has been successfully checked in. Order LLD §6.3: advances ServiceDelivery toward IN_DELIVERY.",
+      "required": ["eventId", "type", "version", "tenantId", "departureId", "occurredAt", "payload"],
+      "properties": {
+        "eventId":       { "$ref": "#/$defs/Ulid" },
+        "type":          { "const": "PassengerCheckedIn" },
+        "version":       { "const": 1 },
+        "tenantId":      { "type": "string" },
+        "departureId":   { "$ref": "#/$defs/Ulid" },
+        "flightRef":     { "type": "string" },
+        "occurredAt":    { "type": "string", "format": "date-time" },
+        "correlationId": { "type": "string" },
+        "causationId":   { "type": "string" },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["checkInId", "orderRef", "paxRef", "segmentRef", "checkedInAt"],
+          "properties": {
+            "checkInId":   { "$ref": "#/$defs/Ulid" },
+            "orderRef":    { "type": "string" },
+            "paxRef":      { "type": "string" },
+            "segmentRef":  { "type": "string" },
+            "checkedInAt": { "type": "string", "format": "date-time" }
+          }
+        }
+      }
+    },
+    "BoardingPassIssued": {
+      "type": "object",
+      "description": "A boarding pass has been issued for a checked-in, seated passenger.",
+      "required": ["eventId", "type", "version", "tenantId", "departureId", "occurredAt", "payload"],
+      "properties": {
+        "eventId":       { "$ref": "#/$defs/Ulid" },
+        "type":          { "const": "BoardingPassIssued" },
+        "version":       { "const": 1 },
+        "tenantId":      { "type": "string" },
+        "departureId":   { "$ref": "#/$defs/Ulid" },
+        "flightRef":     { "type": "string" },
+        "occurredAt":    { "type": "string", "format": "date-time" },
+        "correlationId": { "type": "string" },
+        "causationId":   { "type": "string" },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["boardingPassId", "checkInId", "orderRef", "paxRef", "seatNumber", "sequenceNumber", "issuedAt"],
+          "properties": {
+            "boardingPassId": { "$ref": "#/$defs/Ulid" },
+            "checkInId":      { "$ref": "#/$defs/Ulid" },
+            "orderRef":       { "type": "string" },
+            "paxRef":         { "type": "string" },
+            "seatNumber":     { "type": "string" },
+            "sequenceNumber": { "type": "integer", "minimum": 1 },
+            "seatSource":     { "$ref": "#/$defs/SeatAssignmentSource" },
+            "issuedAt":       { "type": "string", "format": "date-time" }
+          }
+        }
+      }
+    },
+    "BagAccepted": {
+      "type": "object",
+      "description": "A checked bag has been accepted. Thin in this tranche; real baggage tracking deferred.",
+      "required": ["eventId", "type", "version", "tenantId", "departureId", "occurredAt", "payload"],
+      "properties": {
+        "eventId":       { "$ref": "#/$defs/Ulid" },
+        "type":          { "const": "BagAccepted" },
+        "version":       { "const": 1 },
+        "tenantId":      { "type": "string" },
+        "departureId":   { "$ref": "#/$defs/Ulid" },
+        "flightRef":     { "type": "string" },
+        "occurredAt":    { "type": "string", "format": "date-time" },
+        "correlationId": { "type": "string" },
+        "causationId":   { "type": "string" },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["bagAcceptanceId", "checkInId", "orderRef", "paxRef", "bagTagRef", "weightKg", "acceptedAt"],
+          "properties": {
+            "bagAcceptanceId": { "$ref": "#/$defs/Ulid" },
+            "checkInId":       { "$ref": "#/$defs/Ulid" },
+            "orderRef":        { "type": "string" },
+            "paxRef":          { "type": "string" },
+            "bagTagRef":       { "type": "string" },
+            "weightKg":        { "type": "number", "minimum": 0 },
+            "ancillaryRef":    { "type": ["string", "null"] },
+            "acceptedAt":      { "type": "string", "format": "date-time" }
+          }
+        }
+      }
+    },
+    "PassengerBoarded": {
+      "type": "object",
+      "description": "A passenger has boarded at the gate. Order LLD §6.3: air ServiceDelivery line moves toward DELIVERED.",
+      "required": ["eventId", "type", "version", "tenantId", "departureId", "occurredAt", "payload"],
+      "properties": {
+        "eventId":       { "$ref": "#/$defs/Ulid" },
+        "type":          { "const": "PassengerBoarded" },
+        "version":       { "const": 1 },
+        "tenantId":      { "type": "string" },
+        "departureId":   { "$ref": "#/$defs/Ulid" },
+        "flightRef":     { "type": "string" },
+        "occurredAt":    { "type": "string", "format": "date-time" },
+        "correlationId": { "type": "string" },
+        "causationId":   { "type": "string" },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["checkInId", "orderRef", "paxRef", "segmentRef", "seatNumber", "boardedAt"],
+          "properties": {
+            "checkInId":  { "$ref": "#/$defs/Ulid" },
+            "orderRef":   { "type": "string" },
+            "paxRef":     { "type": "string" },
+            "segmentRef": { "type": "string" },
+            "seatNumber": { "type": "string" },
+            "boardedAt":  { "type": "string", "format": "date-time" }
+          }
+        }
+      }
+    },
+    "FlightClosed": {
+      "type": "object",
+      "description": "The flight has been closed — the G4 headline event, published exactly once. Order LLD §6.3: all delivery lines for this flight resolve; orders move toward FULFILLED. Closes the OOSD loop (Offer → Order → Deliver).",
+      "required": ["eventId", "type", "version", "tenantId", "departureId", "occurredAt", "payload"],
+      "properties": {
+        "eventId":       { "$ref": "#/$defs/Ulid" },
+        "type":          { "const": "FlightClosed" },
+        "version":       { "const": 1 },
+        "tenantId":      { "type": "string" },
+        "departureId":   { "$ref": "#/$defs/Ulid" },
+        "flightRef":     { "type": "string" },
+        "occurredAt":    { "type": "string", "format": "date-time" },
+        "correlationId": { "type": "string" },
+        "causationId":   { "type": "string" },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["closedAt", "totalBoarded", "totalCheckedIn"],
+          "properties": {
+            "closedAt":       { "type": "string", "format": "date-time" },
+            "totalBoarded":   { "type": "integer", "minimum": 0 },
+            "totalCheckedIn": { "type": "integer", "minimum": 0 },
+            "totalNoShow":    { "type": "integer", "minimum": 0 },
+            "wbAckRef":       { "type": ["string", "null"] }
+          }
+        }
+      }
+    }
+  },
+  "oneOf": [
+    { "$ref": "#/$defs/PassengerCheckedIn" },
+    { "$ref": "#/$defs/BoardingPassIssued" },
+    { "$ref": "#/$defs/BagAccepted" },
+    { "$ref": "#/$defs/PassengerBoarded" },
+    { "$ref": "#/$defs/FlightClosed" }
+  ]
+}

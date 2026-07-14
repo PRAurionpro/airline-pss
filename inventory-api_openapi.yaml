@@ -1,0 +1,371 @@
+openapi: 3.0.3
+info:
+  title: PSS Inventory & Availability Module API
+  version: "1.0.0-draft"
+  description: >
+    API for the Inventory & Availability module of the Aurionpro PSS platform.
+    Inventory is the authoritative source of what can be sold and holds the
+    no-oversell invariant. This contract realises the operations in the Inventory
+    Module Low-Level Design (§8).
+
+    Conventions:
+      * Tenant context is derived from the verified bearer token (tenant claim); there is
+        no tenant path/query parameter. A request without tenant context is rejected.
+      * Reads (availability) are side-effect-free and need no Idempotency-Key.
+      * Every state-changing hold operation (create / confirm / release) requires an
+        Idempotency-Key header; a repeated key returns the original result.
+      * The no-oversell invariant is enforced server-side: a hold or confirm that would
+        oversell is rejected with 422.
+      * Errors use the problem+json model (RFC 9457).
+
+    Provisional choices pending residual decisions (LLD §13): default hold TTL,
+    availability read-model freshness window. These are marked PROVISIONAL.
+  contact:
+    name: Aurionpro Solutions Limited — PSS Platform
+    url: https://www.aurionpro.com
+
+servers:
+  - url: https://{host}
+    description: Gateway base URL (region-specific; India regions first)
+    variables:
+      host:
+        default: api.pss.local
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Availability
+    description: Search and read bookable flights and classes (read model).
+  - name: Holds
+    description: Create, confirm and release inventory holds (write model).
+
+paths:
+  /v1/availability/search:
+    post:
+      tags: [Availability]
+      operationId: searchAvailability
+      summary: Search bookable flights and classes
+      description: >
+        Returns flights matching the origin/destination/date and the bookable classes for
+        the requested passengers, from the availability read model. Side-effect-free; holds
+        nothing.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AvailabilitySearchRequest'
+            examples:
+              one-way-one-adult:
+                summary: One adult, BLR→BOM, single date
+                value:
+                  origin: BLR
+                  destination: BOM
+                  departureDate: "2026-07-15"
+                  passengers: [{ ptc: ADT, count: 1 }]
+      responses:
+        '200':
+          description: Matching flights with bookable classes.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AvailabilitySearchResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /v1/availability/{flightInventoryId}:
+    get:
+      tags: [Availability]
+      operationId: getAvailability
+      summary: Get current availability for one flight
+      parameters:
+        - $ref: '#/components/parameters/FlightInventoryIdPath'
+      responses:
+        '200':
+          description: Current bookable classes for the flight.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FlightAvailability'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/holds:
+    post:
+      tags: [Holds]
+      operationId: createHold
+      summary: Place a hold on inventory
+      description: >
+        Reserves the requested seats in the named classes for a bounded TTL, decrementing
+        available (not committed) inventory under the no-oversell invariant. Used by the
+        Order saga before payment.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateHoldRequest'
+            examples:
+              hold-one-seat:
+                summary: Hold one seat in class B on one flight
+                value:
+                  items:
+                    - flightInventoryId: 01HZX3K7Qn8r2m9c4ts6v0b1aa
+                      rbd: B
+                      quantity: 1
+                  ttlSeconds: 600
+      responses:
+        '201':
+          description: Hold created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Hold'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /v1/holds/{holdId}:
+    get:
+      tags: [Holds]
+      operationId: getHold
+      summary: Get a hold
+      parameters:
+        - $ref: '#/components/parameters/HoldIdPath'
+      responses:
+        '200':
+          description: The hold.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Hold'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/holds/{holdId}/confirm:
+    post:
+      tags: [Holds]
+      operationId: confirmHold
+      summary: Confirm a hold (commit the seats)
+      description: >
+        Converts a held reservation into committed inventory on payment success. Idempotent.
+        Rejected with 422 if the hold has expired or the seats are no longer available.
+      parameters:
+        - $ref: '#/components/parameters/HoldIdPath'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      responses:
+        '200':
+          description: Hold confirmed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Hold'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+
+  /v1/holds/{holdId}/release:
+    post:
+      tags: [Holds]
+      operationId: releaseHold
+      summary: Release a hold (return the seats)
+      description: >
+        Returns held seats to available inventory (saga compensation, cancellation, or
+        manual release). Idempotent.
+      parameters:
+        - $ref: '#/components/parameters/HoldIdPath'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      responses:
+        '200':
+          description: Hold released.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Hold'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >
+        OAuth2/OIDC access token. The tenant is taken from a verified claim in the token;
+        there is no tenant path or query parameter. RBAC/ABAC is enforced per operation.
+
+  parameters:
+    FlightInventoryIdPath:
+      name: flightInventoryId
+      in: path
+      required: true
+      description: Internal flight-inventory identifier (ULID).
+      schema:
+        $ref: '#/components/schemas/Ulid'
+    HoldIdPath:
+      name: holdId
+      in: path
+      required: true
+      description: Internal hold identifier (ULID).
+      schema:
+        $ref: '#/components/schemas/Ulid'
+    IdempotencyKeyHeader:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Client-generated key making the operation safe to retry.
+      schema: { type: string, minLength: 8, maxLength: 64 }
+
+  responses:
+    BadRequest:
+      description: Validation failure (malformed payload, unknown class).
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Unauthorized:
+      description: Missing or invalid authorisation / tenant context.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Forbidden:
+      description: Authenticated but not permitted for this operation or tenant.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    NotFound:
+      description: Flight or hold not visible to the tenant.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Conflict:
+      description: Hold not in a state that permits the operation, or duplicate non-idempotent submission.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Unprocessable:
+      description: No-oversell violation — insufficient availability to hold, or hold expired/unavailable at confirm.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    ServiceUnavailable:
+      description: Transient downstream failure; safe to retry with the same Idempotency-Key.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+  schemas:
+    Ulid:
+      type: string
+      description: ULID identifier.
+    PassengerCount:
+      type: object
+      required: [ptc, count]
+      properties:
+        ptc: { type: string, enum: [ADT, CHD, INF], description: Passenger-type code. }
+        count: { type: integer, minimum: 1, maximum: 9 }
+    HoldStatus:
+      type: string
+      enum: [HELD, CONFIRMED, RELEASED, EXPIRED]
+    BookingClass:
+      type: object
+      properties:
+        rbd: { type: string, description: 'Reservation booking designator (e.g. B).' }
+        cabin: { type: string, description: 'Cabin (e.g. Y).' }
+        availableSeats: { type: integer, minimum: 0 }
+        status: { type: string, enum: [OPEN, WAITLIST, CLOSED] }
+    FlightAvailability:
+      type: object
+      properties:
+        flightInventoryId: { $ref: '#/components/schemas/Ulid' }
+        origin: { type: string }
+        destination: { type: string }
+        departure: { type: string, format: date-time }
+        arrival: { type: string, format: date-time }
+        classes:
+          type: array
+          items: { $ref: '#/components/schemas/BookingClass' }
+    AvailabilitySearchRequest:
+      type: object
+      required: [origin, destination, departureDate, passengers]
+      properties:
+        origin: { type: string, description: 'Origin IATA code.' }
+        destination: { type: string, description: 'Destination IATA code.' }
+        departureDate: { type: string, format: date }
+        returnDate: { type: string, format: date }
+        cabin: { type: string, description: 'Optional cabin filter.' }
+        passengers:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/PassengerCount' }
+    AvailabilitySearchResponse:
+      type: object
+      properties:
+        flights:
+          type: array
+          items: { $ref: '#/components/schemas/FlightAvailability' }
+    HoldItemRequest:
+      type: object
+      required: [flightInventoryId, rbd, quantity]
+      properties:
+        flightInventoryId: { $ref: '#/components/schemas/Ulid' }
+        rbd: { type: string }
+        quantity: { type: integer, minimum: 1, maximum: 9 }
+    CreateHoldRequest:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/HoldItemRequest' }
+        orderId:
+          allOf:
+            - $ref: '#/components/schemas/Ulid'
+          description: 'The order this hold is for; supplied by the Order saga. Echoed into every hold event and used as the hold-event partition key.'
+        ttlSeconds:
+          type: integer
+          minimum: 30
+          maximum: 3600
+          description: 'Requested hold lifetime; server may cap it. PROVISIONAL default 600.'
+    HoldItem:
+      type: object
+      properties:
+        flightInventoryId: { $ref: '#/components/schemas/Ulid' }
+        rbd: { type: string }
+        quantity: { type: integer }
+    Hold:
+      type: object
+      required: [holdId, status, items]
+      properties:
+        holdId: { $ref: '#/components/schemas/Ulid' }
+        status: { $ref: '#/components/schemas/HoldStatus' }
+        expiresAt: { type: string, format: date-time }
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/HoldItem' }
+        version: { type: integer, description: 'Optimistic-concurrency token.' }
+    Problem:
+      type: object
+      description: RFC 9457 problem detail.
+      required: [type, title, status]
+      properties:
+        type: { type: string, format: uri, example: 'https://errors.pss/aurionpro/inventory/oversell' }
+        title: { type: string, example: Insufficient availability }
+        status: { type: integer, example: 422 }
+        detail: { type: string, example: Requested 2 seats in class B but only 1 is available. }
+        instance: { type: string, format: uri }
+        code: { type: string, description: 'Stable machine-readable error code.', example: INVENTORY_OVERSELL }

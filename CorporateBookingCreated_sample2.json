@@ -1,0 +1,18 @@
+{
+  "eventId": "01J9ZX9M4T1A2B3C4D5E6F7G8H",
+  "type": "CorporateBookingCreated",
+  "version": 1,
+  "tenantId": "airline-AI",
+  "occurredAt": "2026-07-02T14:47:05.987Z",
+  "payload": {
+    "bookingId": "01J9ZX9M4T1K2M3N4P5Q6R7S8T",
+    "accountId": "01J9ZX9M4T1V2W3X4Y5Z6A7B8C",
+    "travellerId": "01J9ZX9M4T1D2E3F4G5H6J7K8M",
+    "costCentreCode": "SALES-EMEA",
+    "orderRef": "ORD-Q9V2LT",
+    "totalAmount": 88999.50,
+    "currency": "INR",
+    "policyStatus": "ADVISORY",
+    "sellerRef": "CORP-01J9ZX9M4T1V2W3X4Y5Z6A7B8C-CC-SALES-EMEA"
+  }
+}

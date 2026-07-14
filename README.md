@@ -1,251 +1,48 @@
-# PSS Platform
+# Order Module — API & Event Contracts
 
-## Overview
+Contract-first artifacts for the Order module of the Aurionpro PSS platform.
+These realise the **Order Module Low-Level Design (LLD)** — `order-api.openapi.yaml`
+covers LLD §5 (API) and `order-events.schema.json` covers LLD §6 (events).
+Drop this folder into the service repository / Claude Code project context so generated
+code stays aligned to the contract.
 
-PSS Platform (Passenger Service System) is a modern, multi-tenant airline platform developed by Aurionpro. It enables airlines to manage the complete passenger journey, from flight search and booking to payment, check-in, boarding, and loyalty management.
+## Files
 
-The platform is built using a microservices architecture with contract-first APIs, event-driven communication, and automated governance to ensure scalability, maintainability, and reliability.
+| File | What it is | Validated with |
+|------|------------|----------------|
+| `order-api.openapi.yaml` | OpenAPI 3.0.3 spec for the Order API (Create / Get / List / Change / Cancel). | `openapi-spec-validator` — PASS |
+| `order-events.schema.json` | JSON Schema (draft 2020-12) for the published domain events, one envelope + 7 event types. | `jsonschema` Draft202012 `check_schema` — PASS |
 
----
+## API conventions (enforced by the spec)
 
-## Key Features
+- **Tenant from token** — tenant context comes from a verified claim in the OAuth2/OIDC bearer token; there is no tenant path/query parameter.
+- **Idempotency** — every state-changing call (`createOrder`, `changeOrder`, `cancelOrder`) requires an `Idempotency-Key` header.
+- **Optimistic concurrency** — `changeOrder` / `cancelOrder` require the current ETag via `If-Match`; a stale version returns `409`.
+- **Errors** — `application/problem+json` (RFC 9457) with a stable machine-readable `code`.
+- **ONE Order mapping** — operations map to the OrderCreate / OrderRetrieve / OrderChange / OrderCancel message families.
 
-- Flight Search & Booking
-- Pricing & Inventory Management
-- Payment Gateway Integration (Razorpay Sandbox)
-- Order Management
-- NDC Distribution
-- Corporate Travel Portal
-- Loyalty Program
-- Customer Portal
-- Departure Control System (DCS)
-- Revenue Management
-- Customer Personalization (CDP)
-- WhatsApp Conversational Commerce
-- Reporting & Analytics Dashboard
+## Events
 
----
+Single envelope (`eventId`, `type`, `version`, `tenantId`, `orderId`, `occurredAt`, `correlationId`, `causationId`, `payload`); the concrete event is selected by the `type` constant. Consumers must be **idempotent on `eventId`**. Types: `OrderCreated`, `OrderConfirmed`, `OrderItemAdded`, `OrderItemCancelled`, `OrderChanged`, `OrderCancelled`, `OrderFulfilled`.
 
-## Architecture
+## Provisional — pending LLD §14 decisions
 
-- Microservices Architecture
-- Event-Driven Communication (Kafka/Redpanda)
-- REST APIs (OpenAPI)
-- Docker-based Deployment
-- Contract-First Development
-- Multi-Tenant Design
-- CI/CD Governance & Fitness Functions
+These are encoded with sensible defaults and marked in the spec; confirm before freezing the contract:
 
----
+- `orderRef` format (currently `^[A-Z0-9]{6}$`).
+- Pinned ONE Order / NDC schema generation.
+- Default inventory hold TTL.
 
-## Technology Stack
+## Phase 1 note
 
-### Backend
-- Java 21
-- Spring Boot
-- Gradle
+Only `ADD_ITEM` and `CANCEL_ITEM` are built for `changeOrder` in Phase 1; `EXCHANGE_ITEM` is in the contract but deferred (LLD §12). Air items only in Phase 1; ancillary/service items follow in Phase 2.
 
-### Frontend
-- React
-- HTML
-- CSS
-- JavaScript
-
-### Database
-- Service-specific Databases
-
-### Messaging
-- Kafka / Redpanda
-
-### Containerization
-- Docker
-- Docker Compose
-
-### API Documentation
-- OpenAPI
-
----
-
-## Prerequisites
-
-Before running the application, ensure you have:
-
-- Java JDK 21
-- Docker Desktop
-- Docker Compose
-- Git
-- Gradle Wrapper (included)
-- GitHub Account
-
----
-
-## Installation
-
-### Clone Repository
+## Regenerating / validating
 
 ```bash
-git clone https://github.com/<your-org>/pss-platform.git
-cd pss-platform
+pip install --break-system-packages openapi-spec-validator jsonschema
+python -c "from openapi_spec_validator import validate; import yaml; validate(yaml.safe_load(open('order-api.openapi.yaml')))"
+python -c "import json; from jsonschema.validators import Draft202012Validator as D; D.check_schema(json.load(open('order-events.schema.json')))"
 ```
 
-### Build
-
-```bash
-./gradlew build
-```
-
-### Start Application
-
-```bash
-docker compose -f docker-compose.demo.yml -f docker-compose.demo-full.yml up -d
-```
-
-### Seed Demo Data
-
-```bash
-./scripts/demo-reset-full.sh
-```
-
----
-
-## Application URL
-
-```
-http://localhost:8093
-```
-
----
-
-## Project Modules
-
-- Offer Service
-- Order Service
-- Inventory Service
-- Pricing Service
-- Payment Service
-- Distribution Service
-- Corporate Portal
-- Loyalty Service
-- Customer Portal
-- Reporting Service
-- Revenue Management
-- Departure Control System
-- Customer Data Platform
-- WhatsApp Integration
-
----
-
-## Current Status
-
-- Phase 1 – Complete
-- Phase 2 – Complete
-- Demo Product Program – In Progress
-- Workstream 3 – Next Priority
-- Workstream 4 – Planned
-- Workstream 5 – Planned
-
----
-
-## Repository Structure
-
-```
-docs/
-scripts/
-docker/
-services/
-gateway/
-platform/
-README.md
-```
-
----
-
-## Development Workflow
-
-1. Create Feature Branch
-2. Implement Changes
-3. Run Local Build
-4. Verify Functionality
-5. Create Pull Request
-6. Code Review
-7. Merge into Main
-
----
-
-## Environment Variables
-
-Create a `.env` file with required secrets.
-
-Example:
-
-```
-RAZORPAY_KEY=
-RAZORPAY_SECRET=
-WEBHOOK_SECRET=
-```
-
-> Do not commit `.env` to Git.
-
----
-
-## Documentation
-
-Important documents:
-
-- README.md
-- LATEST_STATUS.md
-- BUILD_PLAN_DEMO_PRODUCT.md
-- Architecture Decision Records (ADR)
-- DEMO_SCRIPT.md
-
----
-
-## Branch Strategy
-
-```
-main
-develop
-feature/*
-bugfix/*
-release/*
-hotfix/*
-```
-
----
-
-## Best Practices
-
-- Follow Contract-First Development
-- Keep APIs backward compatible
-- Write unit and integration tests
-- Validate OpenAPI contracts
-- Verify UI flows manually before merging
-- Use Pull Requests for all code changes
-
----
-
-## Contributing
-
-1. Fork or create a feature branch.
-2. Commit your changes.
-3. Push to GitHub.
-4. Create a Pull Request.
-5. Obtain code review approval before merging.
-
----
-
-## License
-
-Internal Aurionpro Project.
-
----
-
-## Maintainers
-
-Aurionpro Development Team
-
----
-
-## Contact
-
-For project onboarding or repository access, contact the project owner or engineering lead.
+*Working draft — companion to the System Design Document (v0.2), the Phase 0 & Phase 1 Build Plan, the Order Module LLD, and PSS_Landscape_Design_Roadmap_3.docx.*

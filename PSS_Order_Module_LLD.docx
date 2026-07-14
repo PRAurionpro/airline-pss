@@ -1,0 +1,418 @@
+PSS — Order Module Low-Level Design	Working Draft v0.1
+
+**PASSENGER SERVICE SYSTEM (PSS)**
+
+**Order Module — Low-Level Design**
+
+*Order-native record · ONE Order-conformant · book-pay-fulfil saga · PNR/e-ticket bridge*
+
+Version 0.1 — Working Draft
+
+Prepared: June 2026
+
+Companion to: System Design Document (v0.2), Phase 0 & Phase 1 Build Plan, PSS_Landscape_Design_Roadmap_3.docx
+
+**Prepared by Aurionpro Solutions Limited**
+
+**Table of Contents**
+
+# 1. Introduction and Scope
+
+## 1.1 Purpose
+
+This document is the low-level design (LLD) for the Order module — the first bounded context to be specified in detail because it is the system of record on which every other module depends. It takes the Order Management summary from the System Design Document (SDD §5.2) down to the level an engineer can build from: the domain model and entity relationships, the order state machine, the ONE Order-conformant API contract, the domain events published and consumed, the book-pay-fulfil saga with its compensations, the PNR/e-ticket/EMD bridge, the persistence and consistency design, and the cross-cutting concerns.
+
+## 1.2 Relationship to companion documents
+
+This LLD conforms to the SDD (v0.2) — particularly the Order Management specification, the platform framework (§6), multi-tenancy (§7) and the data architecture (§8) — and is sequenced by the Phase 0 & Phase 1 Build Plan, which fixes the Order domain model as a Phase 0 deliverable and the order-native record plus PNR bridge as Phase 1. The market and standards context is in PSS_Landscape_Design_Roadmap_3.docx. Where this LLD and the SDD overlap, the SDD governs architecture and this document governs the Order module's internal design.
+
+## 1.3 Scope
+
+The full target design of the Order module is specified here so the model is stable from the outset. The subset actually built in Phase 1 (air-only items, e-ticket issuance, cancel/refund, the saga, the outbound PNR bridge) is called out explicitly in Section 12; later capabilities (item exchanges, ancillaries and third-party items, settlement-with-orders, order-based interline) are designed for but deferred.
+
+## 1.4 Audience and conventions
+
+The audience is the engineers and reviewers implementing Order. API and field names are shown in monospace; example payloads are illustrative, not normative schemas. Identifiers use ULIDs unless stated. Money is always an amount plus an ISO-4217 currency. All times are UTC (ISO-8601). 'PTC' is the IATA passenger type code (ADT/CHD/INF).
+
+# 2. Responsibilities and Boundaries
+
+## 2.1 What the Order module owns
+
+- The Order as the single, authoritative record of what a customer bought — its items, passengers, contacts, prices, payment references and delivery status.
+
+- The order lifecycle: creation, change (add / cancel / exchange item), servicing, cancellation and fulfilment, each as an explicit, auditable state transition.
+
+- Orchestration of the book-pay-fulfil saga across Inventory, Payments and Ticketing, including compensation on failure.
+
+- PNR / e-ticket / EMD compatibility during the transition, via an explicit bridge — without letting the legacy shape leak into the core model.
+
+## 2.2 What the Order module does not own
+
+Order links to, but never owns, the following — it holds their identifiers and reacts to their events:
+
+| **Concern** | **Owner** | **Order****'****s relationship** |
+| --- | --- | --- |
+| Offer construction & pricing of a shopping result | Offer Management | Receives a selected offer reference; re-validates it at order creation. |
+| Sellable counts, holds, oversell policy | Inventory / Availability | Requests holds and confirmations; stores the hold/segment references. |
+| Fare rules, taxes, repricing logic | Pricing & Fares | Calls reprice on change; stores resulting price components. |
+| Money capture, refunds, tokenized instruments | Payments & Settlement | Initiates payment; stores a PaymentReference; never stores PAN. |
+| Check-in, boarding, baggage, consumption | Delivery / DCS | Consumes delivery events to advance ServiceDelivery and fulfilment. |
+| Order accounting & revenue recognition | Order Accounting (P3) | Emits order events the accounting module consumes. |
+
+## 2.3 Dependencies
+
+**Upstream (calls / consumes): **Offer (validate selected offer), Inventory (hold/confirm/release), Pricing (reprice), Payments (initiate/refund), Ticketing/EMD (issue). **Downstream (notified by events): **Delivery/DCS, Order Accounting, Reporting & BI, Loyalty, Distribution — all react to Order events without tight coupling.
+
+# 3. Domain Model
+
+## 3.1 Aggregate and entities
+
+Order is the aggregate root and the consistency boundary: all writes to an order and its children occur in one transaction against the Order store. Children (OrderItem, Passenger, Contact, ServiceDelivery, PaymentReference) are only mutated through the root, never directly by other modules.
+
+*Figure 1 — Order domain model. The aggregate root owns its children; external concerns are held as references.*
+
+## 3.2 Entity definitions
+
+Order (aggregate root):
+
+| **Field** | **Type / notes** |
+| --- | --- |
+| orderId | ULID, primary key, immutable. |
+| tenantId | Owning tenant; on every row; mandatory in every query. |
+| orderRef | External single reference (ONE Order); human-usable; unique within tenant. |
+| status | Order state (§4): CREATED, CONFIRMED, IN_DELIVERY, FULFILLED, CLOSED, CANCELLED, EXPIRED. |
+| currency / totalAmount | Order currency (ISO-4217) and current total (sum of item prices + taxes). |
+| amountPaid / balanceDue | Settled amount and outstanding balance, kept consistent with PaymentReferences. |
+| offerRef | The accepted offer the order was created from (provenance). |
+| createdAt / updatedAt | UTC timestamps. |
+| version | Optimistic-concurrency token (incremented per change). |
+
+OrderItem:
+
+| **Field** | **Type / notes** |
+| --- | --- |
+| orderItemId / orderId | PK and parent reference. |
+| type | AIR │ ANCILLARY │ SERVICE (third-party). |
+| status | OrderItem state (§4.2): ORDERED, CONFIRMED/TICKETED, DELIVERED, CANCELLED, EXCHANGED, REFUNDED. |
+| passengerId | The passenger this item is for. |
+| segmentRef / productRef | Reference to the inventory segment (AIR) or product (ancillary/service). |
+| price / taxes | Item price plus tax breakdown (e.g. GST components for India). |
+| documentRef | e-ticket / EMD number once issued (held via the bridge). |
+
+Passenger, Contact, ServiceDelivery and PaymentReference:
+
+| **Entity** | **Key fields** |
+| --- | --- |
+| Passenger | passengerId, orderId, ptc {ADT│CHD│INF}, givenName, surname, dateOfBirth, docRef (travel document, encrypted), loyaltyRef. |
+| Contact | contactId, orderId, email, phone, locale, consentFlags (DPDP consent for contact & marketing). |
+| ServiceDelivery | deliveryId, orderItemId, state {PENDING│DELIVERED│FAILED}, deliveredAt, location — advanced by Delivery/DCS events. |
+| PaymentReference | paymentRefId, orderId, paymentIntentId (→ Payments), status, amount, method {UPI│RUPAY│CARD│NETBANKING}; no card data held. |
+
+## 3.3 Identifiers and the single order reference
+
+Internally the order is keyed by an immutable ULID (orderId). Externally it is addressed by orderRef — the ONE Order 'single reference' that replaces the PNR record locator as the one identifier a customer, agent or partner uses. During the transition the legacy PNR locator and e-ticket/EMD numbers are also retained (as references on the order and its items) so the order can be matched to legacy systems through the bridge (§8). The orderRef format and whether it is globally unique or unique-per-tenant is a residual decision (§14).
+
+## 3.4 Money, taxes and amounts
+
+Every monetary value is an amount plus an ISO-4217 currency; no bare numbers. Item prices carry a tax breakdown so jurisdiction-specific taxes — GST for the India first market — are explicit and auditable rather than folded into a single figure. The order keeps totalAmount, amountPaid and balanceDue mutually consistent within the aggregate transaction; the authoritative money movement remains in Payments, which the order links to via PaymentReference.
+
+## 3.5 ONE Order alignment
+
+The model maps directly onto IATA ONE Order / NDC concepts so conformance is structural, not bolted on:
+
+| **This module** | **ONE Order / NDC concept** |
+| --- | --- |
+| Order (aggregate root) | Order — the single integrated customer record. |
+| orderRef | Order ID / single reference (replaces the PNR record locator). |
+| OrderItem (AIR / ANCILLARY / SERVICE) | Order Item / Service. |
+| Passenger (ptc) | Passenger (passenger type code). |
+| PaymentReference | Payment / form-of-payment linkage. |
+| ServiceDelivery | Service delivery / consumption status. |
+| documentRef (e-ticket / EMD) | Legacy accountable documents, retained only via the bridge. |
+| APIs: Create/Get/Change/Cancel Order | OrderCreate / OrderRetrieve / OrderChange / OrderCancel message families. |
+
+# 4. Order State Machine
+
+## 4.1 Order states
+
+The order moves through an explicit lifecycle. Every transition is triggered by a command or a consumed event, guarded by a precondition, and recorded as a domain event.
+
+*Figure 2 — Order state machine. Terminal states EXPIRED and CANCELLED are reached via saga compensation.*
+
+| **State** | **Meaning** |
+| --- | --- |
+| CREATED | Order exists but is unpaid; inventory is held with a TTL; awaiting payment. |
+| CONFIRMED | Payment settled, inventory confirmed and documents issued; the order is committed. |
+| IN_DELIVERY | One or more items are being consumed (checked in / first flown). |
+| FULFILLED | All items delivered; ready for final accounting. |
+| CLOSED | Accounting reconciled; the order is archived/terminal. |
+| CANCELLED | Cancelled by customer or airline; refunds/compensation processed. |
+| EXPIRED | Payment was not completed within the hold TTL; inventory released. |
+
+## 4.2 OrderItem states
+
+Items have their own lifecycle so an order can be partially changed or delivered: ORDERED (selected, part of a pending order) → CONFIRMED/TICKETED (paid and documented) → DELIVERED (consumed); plus CANCELLED, EXCHANGED (replaced by a new item) and REFUNDED. The order's state is derived from its items (e.g. an order is FULFILLED only when all live items are DELIVERED).
+
+## 4.3 Transition rules
+
+| **From → To** | **Trigger** | **Guard / effect** |
+| --- | --- | --- |
+| CREATED → CONFIRMED | PaymentSettled + InventoryConfirmed + Ticketed | All three must hold; emit OrderConfirmed. |
+| CREATED → EXPIRED | Hold TTL elapses without payment | Release inventory; emit OrderCancelled (reason=expired). |
+| CREATED → CANCELLED | CancelOrder | Allowed pre-payment; release hold; emit OrderCancelled. |
+| CONFIRMED → CONFIRMED | ChangeOrder (add/cancel item) | Reprice; adjust payment; emit OrderChanged / OrderItem events. |
+| CONFIRMED → CANCELLED | CancelOrder | Apply fare rules; refund via Payments; emit OrderCancelled. |
+| CONFIRMED → IN_DELIVERY | First DeliveryConfirmed (check-in / boarding) | Advance item; emit nothing new beyond item event. |
+| IN_DELIVERY → FULFILLED | All items DELIVERED | Emit OrderFulfilled (triggers revenue recognition). |
+| FULFILLED → CLOSED | Accounting reconciled | Terminal; archival per retention policy. |
+
+# 5. API Contract (ONE Order-conformant)
+
+## 5.1 Conventions
+
+- **Style. **REST/JSON over the platform gateway; resources are versioned (e.g. /v1/orders); external partners use the equivalent NDC/ONE Order OrderCreate/Change/Retrieve messages mapped onto the same operations.
+
+- **Idempotency. **Every state-changing call carries an Idempotency-Key header; a repeated key returns the original result instead of acting twice.
+
+- **Concurrency. **ChangeOrder/CancelOrder are optimistic-locked via an ETag / version; a stale version is rejected with 409 Conflict.
+
+- **Tenancy ****&**** auth. **Tenant context is taken from the verified token at the gateway; access is RBAC/ABAC; a request without tenant context is rejected.
+
+- **Pagination ****&**** errors. **ListOrders is cursor-paginated; errors use a problem+json model (§5.6).
+
+## 5.2 CreateOrder
+
+POST /v1/orders   — create an order from a selected offer. Idempotent.
+
+| *Request (illustrative)* POST /v1/orders        Idempotency-Key: 4e2a...c9 {   "offerRef": "OFR_01HZX...",            // accepted offer   "passengers": [     { "ref":"P1","ptc":"ADT","givenName":"A","surname":"Rao",       "document":{"type":"PASSPORT","number":"<tokenized>"} }   ],   "contact": { "email":"a@x.com","phone":"+91...","consent":true },   "payment": { "intentRef":"PI_01HZX...","method":"UPI" } } |
+| --- |
+
+| *Response (illustrative)* 201 Created     ETag: "1" {   "orderId":"01HZX...", "orderRef":"AB12CD", "status":"CREATED",   "currency":"INR", "totalAmount":5499.00, "balanceDue":5499.00,   "items":[ {"orderItemId":"01HZ...","type":"AIR","status":"ORDERED",              "segmentRef":"SEG_..","passengerRef":"P1"} ],   "_links": { "self":"/v1/orders/01HZX..." } } |
+| --- |
+
+CreateOrder validates the offer against Offer and Inventory, persists the order as CREATED, places the inventory hold and starts the book-pay-fulfil saga (§7). It does not block on payment completion.
+
+## 5.3 GetOrder and ListOrders
+
+GET /v1/orders/{orderId}  and  GET /v1/orders?passenger=&status=&cursor=  — retrieve one order, or list tenant orders with filters (cursor-paginated). Read-optimised; p95 target < 300 ms.
+
+## 5.4 ChangeOrder
+
+POST /v1/orders/{orderId}/changes  — add, cancel or exchange an item; repriced deterministically. Requires the current ETag.
+
+| *Request (illustrative)* POST /v1/orders/01HZX.../changes     If-Match: "1" {   "operation":"ADD_ITEM",   "item": { "type":"ANCILLARY","productRef":"BAG_20KG","passengerRef":"P1" } } // → reprice, adjust balanceDue, emit OrderItemAdded + OrderChanged |
+| --- |
+
+In Phase 1 only ADD_ITEM and CANCEL_ITEM (with refund) are built; EXCHANGE_ITEM is designed but deferred (§12).
+
+## 5.5 CancelOrder
+
+POST /v1/orders/{orderId}/cancel  — cancel the whole order. Pre-payment it releases the hold; post-payment it applies fare rules and triggers a refund via Payments, then emits OrderCancelled.
+
+## 5.6 Error model
+
+| **HTTP** | **Condition** |
+| --- | --- |
+| 400 Bad Request | Validation failure (malformed payload, unknown PTC, missing consent). |
+| 401 / 403 | Missing/insufficient authorisation or tenant context. |
+| 404 Not Found | Order or referenced entity not visible to the tenant. |
+| 409 Conflict | Stale ETag/version, or duplicate non-idempotent submission. |
+| 422 Unprocessable | Offer no longer valid, inventory unavailable at confirm, payment declined. |
+| 503 / Retry | Transient downstream failure; safe to retry with the same Idempotency-Key. |
+
+# 6. Domain Events
+
+## 6.1 Event envelope
+
+Every event shares one envelope so consumers, audit and replay are uniform:
+
+| { "eventId":"01HZ...", "type":"OrderConfirmed", "version":1,   "tenantId":"...", "orderId":"01HZX...", "occurredAt":"...Z",   "correlationId":"...", "causationId":"...", "payload":{ ... } } |
+| --- |
+
+## 6.2 Published events
+
+| **Event** | **Emitted when** | **Key payload** |
+| --- | --- | --- |
+| OrderCreated | Order persisted as CREATED | orderId, orderRef, items, passengers, totals, offerRef |
+| OrderConfirmed | Payment + inventory + ticketing all complete | orderId, documentRefs, amountPaid |
+| OrderItemAdded | Item added via change | orderId, orderItemId, type, price |
+| OrderItemCancelled | Single item cancelled | orderId, orderItemId, refundRef |
+| OrderChanged | Any change applied (incl. reprice) | orderId, changeType, newTotal |
+| OrderCancelled | Whole order cancelled or expired | orderId, reason, refundRef |
+| OrderFulfilled | All items delivered | orderId, fulfilledAt |
+
+## 6.3 Consumed events
+
+| **Event (source)** | **Effect on the order** |
+| --- | --- |
+| InventoryHeld / InventoryConfirmed / InventoryReleased (Inventory) | Advance the saga; record/clear the hold; gate CONFIRMED. |
+| PaymentAuthorised / PaymentSettled / PaymentFailed / RefundIssued (Payments) | Advance or compensate the saga; update amountPaid/balanceDue. |
+| DeliveryConfirmed / PassengerBoarded / FlightClosed (Delivery/DCS) | Advance ServiceDelivery; move toward IN_DELIVERY/FULFILLED. |
+| FareUpdated (Pricing) | Trigger reprice on an in-flight change. |
+
+## 6.4 Delivery guarantees
+
+State and its events are written in one transaction via the transactional outbox, then published reliably — no lost or phantom events. Consumers are idempotent (keyed on eventId) so at-least-once delivery yields exactly-once effects. Ordering is preserved per order (partitioned by orderId).
+
+# 7. The Book-Pay-Fulfil Saga
+
+## 7.1 Orchestration and happy path
+
+Order orchestrates the cross-module booking process through the platform saga orchestrator (§SDD 6). The happy path:
+
+*Figure 3 — Book-pay-fulfil saga: happy path plus the compensation envelope.*
+
+- CreateOrder persists the order as CREATED (pending).
+
+- HoldInventory (with TTL) → InventoryHeld.
+
+- InitiatePayment (UPI / RuPay / card / net-banking) → PaymentSettled.
+
+- ConfirmHold → InventoryConfirmed.
+
+- IssueTicket / EMD → Ticketed.
+
+- Order → CONFIRMED; emit OrderConfirmed (and OrderFulfilled later, on delivery).
+
+## 7.2 Compensation and timeouts
+
+| **Failure point** | **Compensating action** |
+| --- | --- |
+| Payment fails / is declined | ReleaseInventory; order → CANCELLED (reason=payment_failed). |
+| Hold TTL elapses before payment | ReleaseInventory; order → EXPIRED. |
+| Inventory cannot be confirmed | Refund payment; release any hold; order → CANCELLED. |
+| Ticketing/EMD issuance fails | Refund payment; ReleaseInventory; order → CANCELLED; alert. |
+
+## 7.3 Saga state and idempotency
+
+Saga state is persisted (per order) so it survives restarts and can be resumed or compensated. Each step is an idempotent command keyed by the saga/step id; retries are safe. Strong consistency is enforced on the inventory hold, the order state and the payment linkage; everything else is eventually consistent via events.
+
+# 8. PNR / e-ticket / EMD Bridge
+
+## 8.1 Purpose and authority model
+
+During the industry transition the order must interoperate with PNR/e-ticket/EMD-based systems (GDSs, legacy PSS, interline partners). The bridge is an anti-corruption layer: the order model stays clean and order-native, and the bridge translates to and from the legacy shape. Per carrier, the bridge runs in one of two authority modes — order-authoritative (the new platform leads; the PNR is a mirror) or legacy-authoritative (the incumbent leads during migration; the order mirrors it) — switching to order-authoritative once the carrier is fully migrated.
+
+## 8.2 Outbound synchronisation (order → PNR)
+
+On OrderCreated/Confirmed/Changed the bridge maps the order to PNR constructs: order items to segments and SSRs, passengers to name records, the orderRef to/with a record locator, and issued e-ticket/EMD numbers back onto the order items. This is the order-to-PNR 'sync' pattern the incumbents themselves ship.
+
+## 8.3 Inbound synchronisation (PNR → order)
+
+When legacy is authoritative (or a partner changes a PNR), the bridge consumes EDIFACT/Type-B or GDS notifications, translates them into ChangeOrder operations, and reconciles them onto the order — rejecting anything that violates order invariants and flagging conflicts for resolution.
+
+## 8.4 Anti-corruption and reconciliation
+
+The bridge never lets EDIFACT/PNR types into the core domain; all translation is contained in the adapter. A periodic reconciliation job compares order and PNR state and raises discrepancies. The bridge is treated as a first-class, tested product (its own contract tests), not a throwaway script — and is retired per carrier once migration completes.
+
+# 9. Persistence and Data Design
+
+## 9.1 Stores and tables
+
+Order uses a strongly-consistent relational store (PostgreSQL-class). It owns its schema; no other module reads these tables.
+
+| **Table** | **Holds** |
+| --- | --- |
+| orders | The aggregate root: id, tenant, ref, status, currency, totals, version, timestamps. |
+| order_items | Items with type, status, passenger, segment/product ref, price, taxes, documentRef. |
+| passengers / contacts | Passenger and contact rows (PII encrypted at rest). |
+| service_deliveries | Per-item delivery status, advanced by Delivery events. |
+| payment_refs | Links to Payments (intent id, status, amount, method); no card data. |
+| order_events_outbox | Pending domain events written in the same transaction as state. |
+| saga_state | Per-order saga progress for resumption and compensation. |
+
+## 9.2 Consistency and concurrency
+
+Writes to an order and its children are a single transaction (the aggregate is the consistency boundary). Concurrency is optimistic: every change checks and increments version; conflicting writes get 409. Exactly-once effects come from the outbox plus idempotent consumers. Strong/transactional consistency is guaranteed for order state and its financial linkage (D10).
+
+## 9.3 Multi-tenancy and PII
+
+Every row carries tenantId; queries are tenant-scoped by default and rejected without tenant context. In the pooled default tier, rows are isolated at row level and PII (passenger documents, contacts) is encrypted with per-tenant keys, so even shared storage is cryptographically separated. Data residency follows the tenant (India region for the first market), and retention/erasure honour DPDP and contractual rules.
+
+## 9.4 Audit and history
+
+Every transition is captured as an event (the event log is the audit trail) and mirrored to the platform's tamper-evident audit log: who changed which order/field, when, and why. Full order history is reconstructable for dispute, compliance and forensic needs.
+
+## 9.5 Indexing and access patterns
+
+Primary access is by orderId and by (tenantId, orderRef). Secondary indexes support lookup by passenger, by status and by createdAt for servicing and listing. High-read retrieval can be served from a CQRS read model updated from events, isolating read load from the write side.
+
+# 10. Cross-Cutting Concerns
+
+- **Idempotency ****&**** retries. **All state-changing commands and saga steps are idempotent (Idempotency-Key / step id); transient failures are retried safely with back-off.
+
+- **Security ****&**** PCI boundary. **RBAC/ABAC on every operation; the order never stores PAN — only a tokenized PaymentReference — keeping it out of PCI scope.
+
+- **Observability. **Every command and saga step is traced (correlation/causation ids); business metrics (orders created/confirmed, conversion, saga compensation rate) and an SLO on the create→confirm journey are standard via the service template.
+
+- **Configuration. **Per-tenant config governs orderRef format, hold TTL, expiry policy, enabled payment methods and fare-rule references — all config-over-code, no per-tenant forks.
+
+# 11. Non-Functional Targets (Order module)
+
+| **Dimension** | **Target (to ratify)** |
+| --- | --- |
+| **Availability** | Critical-path tier (≥ 99.95%) — Order is on the booking path; graceful degradation of non-critical reads. |
+| **Latency** | CreateOrder p95 within a low single-digit-second budget (excluding external payment authorisation); GetOrder p95 < 300 ms. |
+| **Consistency** | Strong/transactional for order state and financial linkage; idempotent commands; no double-charge, no oversell. |
+| **Throughput** | Scales horizontally with bookings; partitioned by tenant and order; elastic event consumers. |
+| **Recoverability** | RPO ≈ 0 for committed orders (synchronous replication); RTO per the platform DR target. |
+| **Auditability** | Full, tamper-evident history of every transition and field change. |
+
+# 12. Phase-1 Scope vs Full Design
+
+| **Built in Phase 1** | **Designed, deferred** |
+| --- | --- |
+| CreateOrder, GetOrder, ListOrders, CancelOrder | ChangeOrder EXCHANGE_ITEM (item re-issue) |
+| AIR items only; e-ticket/EMD issuance | Ancillary & third-party (SERVICE) items (P2) |
+| Cancel with refund (voluntary) | Involuntary changes / IROPS-driven re-accommodation (P3) |
+| Book-pay-fulfil saga + compensation | Settlement-with-orders & order accounting hand-off (P3) |
+| Outbound PNR / e-ticket bridge (order-authoritative) | Inbound legacy-authoritative sync at scale; order-based interline (P2/P4) |
+| India payment methods linkage; pooled tenant | Bridged/siloed tenant specifics; multi-currency beyond first market |
+
+# 13. Testing Strategy
+
+- **Unit / domain. **State-machine transitions, guards and invariants; money/total calculations including GST.
+
+- **Contract tests. **Consumer-driven contracts for the Order APIs and for every published/consumed event, gating releases (no silent breakage).
+
+- **Integration. **End-to-end against Inventory, Payments and Ticketing stubs/sandboxes, including the PNR bridge adapter.
+
+- **Saga / chaos. **Induced failures and timeouts at each step verify correct compensation (e.g. payment failure releases the hold).
+
+- **Concurrency / oversell. **Parallel creates against scarce inventory confirm no oversell beyond policy and correct 409 behaviour.
+
+- **Idempotency. **Replayed commands and redelivered events produce exactly-once effects.
+
+# 14. Open / Residual Decisions
+
+- orderRef format and length, and whether it is globally unique or unique-per-tenant.
+
+- Default inventory hold TTL and the per-tenant override range.
+
+- Whether the aggregate is event-sourced or state-stored with an audit table (history fidelity vs simplicity).
+
+- The ONE Order / NDC schema generation to pin, and the upgrade cadence behind the adapter.
+
+- Depth of exchange/refund modelling in Phase 1 versus Phase 2.
+
+- Per-carrier default bridge authority mode (order- vs legacy-authoritative) and the switch-over runbook.
+
+- Whether ServiceDelivery is owned by Order or projected as a read model from Delivery/DCS events.
+
+# 15. Appendix
+
+## 15.1 Glossary (delta)
+
+| **Term** | **Meaning** |
+| --- | --- |
+| Aggregate / aggregate root | A cluster of entities treated as one consistency and transaction boundary; Order is the root. |
+| Single reference (orderRef) | The one ONE Order identifier for an order, replacing the PNR record locator. |
+| Anti-corruption layer | An adapter that keeps a legacy model (PNR/EDIFACT) from leaking into the core domain. |
+| Transactional outbox | Persisting state and its event atomically, then publishing reliably. |
+| Saga | A coordinated multi-service transaction with compensating actions on failure. |
+| PTC | Passenger type code (ADT adult, CHD child, INF infant). |
+| EMD / e-ticket | Legacy accountable documents for ancillaries/services and air transport, retained via the bridge. |
+
+*This LLD is a working-draft companion to the System Design Document (v0.2), the Phase 0 **&** Phase 1 Build Plan, and PSS_Landscape_Design_Roadmap_3.docx. Example payloads are illustrative; field-level schemas are defined in the module**'**s OpenAPI / NDC contracts.*
+
+	© 2026 Aurionpro Solutions Limited  ·  Confidential — internal working document	Page  of

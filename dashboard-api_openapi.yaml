@@ -1,0 +1,232 @@
+openapi: 3.0.3
+info:
+  title: PSS Operational Dashboard API
+  version: "0.1.0-draft"
+  description: >
+    Read-side API for the operational dashboard (dashboard-service). This
+    contract documents the service exactly as merged: a single tenant-scoped
+    Server-Sent-Events (SSE) stream that pushes the current dashboard snapshot
+    on connect and re-pushes the whole snapshot on every committed projection
+    change.
+
+    Architecture posture (Dashboard Delta §2):
+      * Dashboard is a read-side CQRS projection. It owns its own `dashboard`
+        Postgres store, is a PURE event CONSUMER (order / payments / inventory /
+        offer backbone topics), and NEVER calls a module API or writes any
+        domain state. This isolation is enforced in CI by
+        check_dashboard_isolation.
+      * The service PUBLISHES no events (no outbox / producer). It emits nothing
+        on the wire except this SSE stream.
+
+    Conventions (carried from the platform):
+      * Tenant context is derived from the verified bearer token (tenant claim);
+        there is no tenant path/query parameter. Because browsers' EventSource
+        cannot set an Authorization header, the stream additionally accepts the
+        token as a `?token=` query parameter, resolved by the same claims reader
+        (see Deviations in README_DASHBOARD_CONTRACTS.md).
+      * There is NO state-changing surface, so no Idempotency-Key and no typed
+        error contract are defined (see Deviations).
+      * Money fields (revenueNet, attachRate) are derived on read, never stored.
+  contact:
+    name: Aurionpro Solutions Limited — PSS Platform
+    url: https://www.aurionpro.com
+
+servers:
+  - url: https://{host}
+    description: Gateway base URL (region-specific; India regions first)
+    variables:
+      host:
+        default: api.pss.local
+  - url: http://localhost:8080
+    description: Local service port (dashboard-service)
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Stream
+    description: Real-time, tenant-scoped dashboard SSE stream.
+
+paths:
+
+  /v1/dashboard/stream:
+    get:
+      tags: [Stream]
+      operationId: streamDashboard
+      summary: Subscribe to the tenant's live dashboard snapshot stream (SSE)
+      description: >
+        Opens a long-lived Server-Sent-Events connection (`text/event-stream`).
+        The server immediately sends one SSE message named `snapshot` whose
+        `data:` line is the full current DashboardSnapshot as JSON, then re-sends
+        the entire snapshot (not a delta) as another `snapshot` message after
+        every committed projection change. The connection is held open until the
+        client disconnects or the configured SSE timeout (default 30 min)
+        elapses.
+
+        Tenant resolution: the verified bearer token claim is used when present
+        (Authorization header); otherwise the optional `token` query parameter is
+        resolved by the same claims reader (the EventSource fallback). If neither
+        yields a tenant the request is rejected.
+      parameters:
+        - name: token
+          in: query
+          required: false
+          description: >
+            JWT carried as a query parameter for browser EventSource clients that
+            cannot set an Authorization header. Same claims reader as the bearer
+            token; the signature is verified upstream. Programmatic clients SHOULD
+            use the Authorization header instead.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: >
+            SSE stream opened. Each message is an SSE `snapshot` event whose data
+            payload is a DashboardSnapshot JSON document (the schema below
+            documents that per-message data payload; the wire framing is SSE, not
+            a single JSON body).
+          content:
+            text/event-stream:
+              schema:
+                $ref: '#/components/schemas/DashboardSnapshot'
+        '500':
+          description: >
+            Tenant context could not be resolved (missing/again-unresolvable
+            token). NOTE: this is the framework default problem+json for an
+            unmapped exception — dashboard-service defines no deliberate 401/403
+            (see Deviations).
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >
+        OAuth2/OIDC access token. The tenant is taken from a verified claim in
+        the token; there is no tenant path or query parameter. For browser
+        EventSource clients the same token may instead be supplied as the
+        `?token=` query parameter.
+
+  schemas:
+
+    DashboardSnapshot:
+      type: object
+      description: >
+        Full dashboard snapshot for one tenant and business date. Pushed in its
+        entirety on connect and on every committed projection change.
+      required:
+        - tenantId
+        - date
+        - funnel
+        - bookings
+        - declines
+        - cancellations
+        - revenueGross
+        - refundsTotal
+        - revenueNet
+        - ancillaryRevenue
+        - attachRate
+        - availability
+        - ticker
+      properties:
+        tenantId:
+          type: string
+          description: Tenant that owns this snapshot.
+        date:
+          type: string
+          format: date
+          description: Business date the snapshot covers.
+        funnel:
+          $ref: '#/components/schemas/Funnel'
+        bookings:
+          type: integer
+          format: int64
+          description: Confirmed bookings on the date.
+        declines:
+          type: integer
+          format: int64
+          description: Declined payments on the date.
+        cancellations:
+          type: integer
+          format: int64
+          description: Cancellations on the date.
+        revenueGross:
+          type: number
+          description: Gross revenue (money; BigDecimal on the wire).
+        refundsTotal:
+          type: number
+          description: Total refunds (money).
+        revenueNet:
+          type: number
+          description: Net revenue; DERIVED on read (gross − refunds), never stored.
+        ancillaryRevenue:
+          type: number
+          description: Ancillary revenue (money).
+        attachRate:
+          type: number
+          description: Ancillary attach rate; DERIVED on read, never stored.
+        availability:
+          type: object
+          description: flightInventoryId → seats-remaining map.
+          additionalProperties:
+            type: integer
+        ticker:
+          type: array
+          description: Recent activity lines, newest-first, capped at 50.
+          items:
+            $ref: '#/components/schemas/TickerLine'
+
+    Funnel:
+      type: object
+      description: Shopping-to-purchase funnel counters for the date.
+      required: [searches, offers, orders, paid]
+      properties:
+        searches:
+          type: integer
+          format: int64
+        offers:
+          type: integer
+          format: int64
+        orders:
+          type: integer
+          format: int64
+        paid:
+          type: integer
+          format: int64
+
+    TickerLine:
+      type: object
+      description: One activity-ticker line.
+      required: [type, summary]
+      properties:
+        type:
+          type: string
+          description: Activity kind (e.g. the source event type).
+        summary:
+          type: string
+          description: Human-readable one-line summary.
+
+    Problem:
+      type: object
+      description: >
+        RFC 9457 problem+json. Dashboard-service enables
+        spring.mvc.problemdetails but defines no custom problem codes; the only
+        error path is the framework default 500 for an unresolved tenant.
+      properties:
+        type:
+          type: string
+          format: uri
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        instance:
+          type: string

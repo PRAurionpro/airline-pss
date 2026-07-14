@@ -1,0 +1,416 @@
+PSS — Landscape, Design & Roadmap	Working Draft v0.1
+
+**PASSENGER SERVICE SYSTEM (PSS)**
+
+**Global Landscape, Target System Design ****&**** Roadmap**
+
+*Initial Discovery **&** Design Document*
+
+Version 0.1 — Working Draft
+
+Prepared: June 2026
+
+Purpose: basis for roadmap & architecture decisions
+
+**Table of Contents**
+
+# 1. Executive Summary
+
+A Passenger Service System (PSS) is the operational and commercial core of an airline's IT estate. It governs how seats are inventoried, how journeys are searched, priced, booked, paid for and ticketed, and how passengers are ultimately checked in and boarded. A failure in the PSS does not degrade gracefully — it grounds an airline. Any design effort therefore has to treat reliability, data integrity and operational continuity as first-class requirements, not afterthoughts.
+
+Two facts shape the opportunity. First, the market is concentrated: a small number of incumbents (Amadeus, Sabre, and the low-cost specialist Navitaire) have historically held the majority of the full-service market, alongside strong regional players such as TravelSky in China and a growing tier of challengers. Second, the entire industry is mid-transition from the legacy reservation/ticketing model (PNRs, e-tickets and EMDs) to a retail model built on IATA's Offer & Order standards — NDC and ONE Order — frequently described through the Offer–Order–Settle–Deliver (OOSD) framework. This transition is large, slow and expensive, which is precisely what creates room for a well-designed new entrant or a modernised internal platform.
+
+This document does three things: (1) it surveys the current global PSS landscape and the vendors competing in it; (2) it decomposes the functional anatomy of a strong PSS, both the classic modules and the modern retailing layer; and (3) it proposes a reference architecture, a set of non-functional requirements, and a phased roadmap for building a competitive system. It is written as a working basis for decisions, not as a final specification — the open questions in Section 11 are deliberately flagged for the team to resolve.
+
+**Headline recommendation: **design the platform **order-native and API-first from day one**, but ship it as a sequence of independently valuable modules that can interoperate with (and gradually displace) legacy PSS functions. Do not attempt a single big-bang build or cutover. The credible path to a strong PSS in 2026 is a modular, cloud-native, standards-aligned platform delivered in phases, with resilience and migration safety engineered in from the start.
+
+# 2. What a PSS Is — Scope and Definitions
+
+Traditionally the PSS is described as three tightly integrated subsystems that together carry a passenger from initial search to boarding:
+
+- **Reservation / Central Reservation System (CRS): **the system of record for schedules, fares, booking rules and passenger records. It manages booking requests, creates and maintains Passenger Name Records (PNRs), holds itinerary, contact, special-service and ticket data, and traditionally drives ticketing.
+
+- **Inventory / Inventory Control System (ICS/AIS): **controls how many seats are sellable on each flight and in each booking class (RBD), opening and closing classes according to revenue-management rules. It may be integrated with or separate from reservations.
+
+- **Departure Control System (DCS): **the airport-facing system. It validates who holds a valid booking, handles check-in and seat assignment, prints/issues boarding documents, captures regulatory data for customs and border control, manages baggage acceptance, and supports load planning and aircraft weight-and-balance.
+
+Around this core sit a set of components often considered part of the broader PSS: fares and pricing, revenue management, e-ticketing and EMD issuance, ancillary/merchandising, loyalty, payments, the internet booking engine (IBE), and the distribution layer that connects the airline to GDSs, OTAs and direct channels.
+
+Architecturally these systems have evolved through three broad generations: **(1)** mainframe/monolithic platforms (the original GDS-era systems); **(2)** service-oriented suites; and **(3)** today's move toward cloud-native microservices with open APIs. Most production PSS estates are a hybrid of all three generations at once, which is the central source of their cost and rigidity.
+
+# 3. The Global PSS Landscape (2026)
+
+## 3.1 Market size and dynamics
+
+Published estimates of PSS market size vary widely depending on how the analyst draws the boundary — narrow "core PSS" definitions land in the hundreds of millions of dollars, while broad definitions that fold in distribution, retailing and adjacent IT report figures in the multiple billions and double-digit annual growth. The exact number matters less than the direction: the market is growing, Asia-Pacific is the fastest-expanding region (driven by China and India), and growth is being pulled by demand for personalisation, ancillary revenue, cloud economics and modern retailing.
+
+A practical read for planning: assume a healthy, growing, but consolidating market in which differentiation increasingly comes from retailing intelligence (offers, pricing, personalisation) rather than from the commodity transactional plumbing.
+
+## 3.2 Who competes, and in which tier
+
+The competitive field can be grouped into four tiers. The boundaries are blurring as everyone races toward Offer & Order, but the tiers remain a useful map:
+
+| **Tier** | **Players (illustrative)** | **Position** |
+| --- | --- | --- |
+| **Global incumbents** | Amadeus (Altéa, and next-gen Nevio), Sabre (SabreSonic, and next-gen SabreMosaic) | Dominant in full-service carriers; deep functionality; large migration books; both now pivoting to Offer & Order. |
+| **LCC / hybrid specialists** | Navitaire (Amadeus), Radixx (Sabre) | Lean, ancillary-focused systems built for low-cost and hybrid carriers; strong merchandising DNA. |
+| **Regional ****&**** mid-market** | TravelSky (China), SITA, IBS Software (iFly), Hitit (Crane / Oxygen), KIU, AeroCRS, Mercator, Sirena-Travel | Strong in specific geographies or carrier sizes; often more flexible and lower-footprint than incumbents. |
+| **Retailing / niche challengers** | Accelya (FLX / FLX ONE), PROS, FLYR, Fetcherr, TPConnects, Branchspace | Best-of-breed in offer/order, dynamic pricing (often generative-AI), NDC distribution and revenue optimisation; sold as modules alongside a core PSS. |
+
+*Tiering is indicative; several vendors span tiers (e.g. Amadeus owns Navitaire; Sabre owns Radixx).*
+
+A defining trend is the rise of multi-vendor strategies: rather than buying one monolithic suite, many airlines now combine a core PSS from a major vendor with revenue management or dynamic pricing from a specialist and payment orchestration from a fintech, deliberately to avoid lock-in and accelerate innovation. This is strategically important for a new design — the realistic go-to-market is often as one or more strong modules in someone else's estate, not only as a full rip-and-replace suite.
+
+## 3.3 The next-generation platforms
+
+Every serious vendor now has an Offer & Order story. Understanding what they are building is the fastest way to define a competitive feature set:
+
+- **Amadeus Nevio — **a modular, cloud-native, AI-enabled retailing stack positioned as PSS-independent, with "smart bridging" to transition from any existing PSS. Finnair, working with Amadeus, is credited with creating the industry's first "Native Order."
+
+- **Sabre SabreMosaic — **an open, modular, cloud-native Offer & Order platform (built with Google Cloud AI) spanning roughly ten product suites from offers and orders through settlement and delivery, plus retail-intelligence tools for pricing, ancillaries and upgrades. It explicitly supports a hybrid PNR-and-Order state, including a "PSS Sync" bridge between orders and PNRs.
+
+- **Accelya FLX ONE — **an API-driven OOSD platform evolved from the FLX retailing engine, which already powers a large share of global NDC volume; emphasises letting airlines transition at their own pace while retaining ownership of strategy.
+
+- **Hitit Oxygen — **a native Offer & Order retailing platform, notable as an early example already in production use at a carrier — evidence that challengers can ship real OOSD systems, not just roadmaps.
+
+- **Specialists (PROS, FLYR, Fetcherr) — **focused on dynamic offer creation and AI/generative pricing that continuously recalibrates fares against live demand, sold into airlines alongside their core PSS.
+
+# 4. The Strategic Inflection: Legacy PSS → Modern Airline Retailing
+
+The single most important strategic fact for this design is the industry-wide shift IATA calls Modern Airline Retailing — the move to "100% Offers and Orders." A new PSS designed in 2026 that merely replicates the PNR/e-ticket/EMD model would be obsolete on arrival. The design must be order-native.
+
+## 4.1 The enabling standards
+
+- **NDC (New Distribution Capability): **an XML/API data standard letting airlines shop, order, pay and service products across channels using Offer and Order messages — breaking the GDS-era constraint where carriers could not richly differentiate or personalise their content.
+
+- **ONE Order: **consolidates the legacy artefacts — PNRs, e-tickets and EMDs — into a single unified record, the Order. This simplifies reservation, delivery and accounting and improves communication between order management, revenue accounting and delivery providers.
+
+- **Dynamic Offers / Settlement with Orders / Future of Interline: **the next layers, moving away from static fare filings and booking classes toward dynamically generated, context-aware offers and order-based settlement and interlining.
+
+## 4.2 The OOSD framework
+
+Modern retailing is commonly structured as four domains. This is the most useful backbone for the target architecture:
+
+| **Domain** | **What it does** |
+| --- | --- |
+| **Offer** | Create, price and personalise what is sold — flights plus ancillaries and third-party content — and deliver the right offer to the right customer on the right channel, in real time. |
+| **Order** | Capture and manage the lifecycle of what the customer bought as a single order record: creation, changes, servicing, cancellations and fulfilment. |
+| **Settle** | Reconcile the money: customer payments, commissions, distribution fees, and direct connectivity to revenue accounting for accurate, real-time financial reconciliation. |
+| **Deliver** | Fulfil the order operationally — check-in, boarding, baggage, onboard services and revenue recognition at the point of consumption. |
+
+## 4.3 Adoption reality (why this is an opportunity, not a settled race)
+
+Despite a decade of NDC, progress is uneven. Industry commentary in mid-2025 put only around a quarter of airlines at meaningful progress toward Offer & Order transformation. Per-carrier transformation is widely characterised as a three-to-seven-year effort costing on the order of tens of millions of dollars, against historically thin airline margins. The implication for this project is twofold: the destination is clear and standardised, but the journey is hard, slow and only partially complete — leaving genuine room for a platform that lowers the cost and risk of getting there.
+
+# 5. Functional Anatomy of a Strong PSS
+
+This section enumerates the components a strong, modern PSS should contain. They are grouped into core transactional services, the retailing layer, operational delivery, and the supporting platform. The capability map at the end summarises priority.
+
+## 5.1 Core transactional services
+
+- **Fleet ****&**** cabin configuration — **master data for aircraft types, cabin layouts and seat maps, equipment characteristics and version control of configurations; drives seat inventory, seat-map display, weight-and-balance and DCS.
+
+- **Schedule ****&**** flight management — **source of truth for flights, schedules, equipment assignment, codeshare and operating data feeding inventory and offers; schedule changes propagate to orders and re-accommodation.
+
+- **Inventory / availability — **class/RBD or, in the target model, dynamic availability; overbooking and segment-level controls; real-time availability calculation at scale.
+
+- **Reservation ****&**** order — **the order record (with PNR compatibility during transition); itinerary, passenger and contact data, SSRs/preferences; group bookings; order changes and servicing.
+
+- **Fares, pricing ****&**** rules — **fare construction, rules, taxes, surcharges; supports both filed fares and dynamic/continuous pricing.
+
+- **Ticketing / document issuance — **e-ticket and EMD issuance during transition, evolving to order-based fulfilment under ONE Order.
+
+## 5.2 Retailing layer (the differentiator)
+
+- **Offer management — **assembles dynamic, personalised offers combining flights, ancillaries and third-party/partner content across all channels; bundling and unbundling.
+
+- **Order management — **full order lifecycle and fulfilment, including servicing, exchanges, refunds and acceptance/settlement of traditional and non-traditional payment types.
+
+- **Dynamic pricing ****&**** offer optimisation — **demand-based, segment-aware pricing; increasingly AI/ML- or generative-AI-driven, recalibrating against live demand signals.
+
+- **Ancillaries ****&**** merchandising — **seats, bags, lounge, Wi-Fi, upgrades, insurance and partner products, merchandised across web, mobile, kiosk and agent channels.
+
+- **Revenue management — **forecasting and optimisation that, in the modern model, feeds offer pricing rather than only opening/closing classes.
+
+- **Frequent Flyer Program (FFP) / loyalty — **member recognition and tier management, miles/points earn and burn within offers and orders, award booking and redemption, and tier benefits surfaced in pricing and servicing. Can be a built module or an integration to a dedicated loyalty platform.
+
+- **Personalisation ****&**** customer data platform — **a 360-degree customer view feeding offer relevance, with consent and privacy controls.
+
+## 5.3 Operational delivery
+
+- **Departure control (check-in, seating, boarding) — **across web, mobile, kiosk, bag-drop and agent; increasingly biometric-enabled.
+
+- **Baggage — **acceptance, tracking and reconciliation, integrated with airport systems.
+
+- **Weight ****&**** balance / load control — **aircraft load planning and safety-critical balance calculation.
+
+- **Irregular operations (IROPS) / disruption — **rebooking, re-accommodation, notifications and compensation handling — a major driver of passenger satisfaction and a frequent failure point in legacy stacks.
+
+## 5.4 Sales channels & distribution
+
+All channels must consume the same offer and order core so pricing, availability and servicing stay consistent. The channel matrix:
+
+- **B2C direct — **internet booking engine (IBE), mobile app, call-centre and airport agent tooling.
+
+- **B2B / travel-agent portal — **a dedicated agency booking surface with agent login, credit/deposit accounts, markups/commissions, mark-downs and back-office/reporting for accredited and non-accredited agents.
+
+- **Corporate ****&**** SME — **negotiated corporate fares, self-booking tools, travel-policy controls, cost-centre tagging and consolidated billing; SME programmes with lighter onboarding and loyalty for small businesses.
+
+- **OTA / TMC / aggregators — **NDC API distribution to online travel agencies, travel-management companies and metasearch; GDS connectivity for the transition period.
+
+- **Interline ****&**** codeshare — **partner selling and, in the target model, order-based interline aligned to Future-of-Interline standards.
+
+- **Conversational commerce (WhatsApp ****&**** chat) — **WhatsApp Business API and chatbot/assistant integration as a feature across booking, servicing (changes, seat/bag add-ons), check-in links, boarding passes, disruption notifications and payment links — a high-engagement channel that reuses the same offer/order APIs.
+
+- **Payments ****&**** settlement — **payment orchestration across methods and currencies; fraud controls; BSP/ARC and revenue-accounting integration.
+
+## 5.5 Platform & cross-cutting services
+
+- Identity, security & access control; comprehensive audit logging.
+
+- **Reporting ****&**** business intelligence — **a standalone reporting/BI module: operational, commercial, financial and regulatory reports; standard report library plus self-service dashboards and scheduled/exportable outputs, fed by the analytics layer.
+
+- **Analytics ****&**** data backbone — **streaming/event backbone, data lake/warehouse feeding ML and the reporting module.
+
+- Notifications & communications across channels.
+
+- Developer platform: API gateway, partner onboarding, sandbox, documentation.
+
+- Observability, configuration and feature management, and a robust testing/simulation harness.
+
+## 5.6 Adjacent integrated system — Cargo management
+
+Cargo is handled as an integrated-but-separate system, consistent with normal airline practice where cargo runs on a dedicated Cargo Management System (CMS) rather than inside the passenger core. The CMS owns its own domain — cargo bookings and capacity, air waybills (AWB), rating, acceptance and handling, ULD and special-cargo handling, tracking and cargo revenue accounting — while integrating with the passenger platform at well-defined points:
+
+- Shared flight, schedule and fleet/aircraft configuration master data.
+
+- Capacity coordination so cargo and belly-hold weight feed weight-and-balance / load control.
+
+- Common identity, payments, settlement and reporting/BI where appropriate.
+
+Treating cargo this way keeps the passenger platform focused, lets cargo evolve on its own cadence (or use a specialist CMS), and avoids coupling two very different transaction models. The integration contract — the APIs and shared master data above — is the part this programme must own.
+
+## 5.7 Capability map and build priority
+
+| **Capability** | **Domain** | **Priority** | **Notes** |
+| --- | --- | --- | --- |
+| Fleet & cabin configuration | Core | Must-have | Master data; drives seat maps, W&B, DCS |
+| Schedule & flight management | Core | Must-have | Source of truth for flights |
+| Order management (order-native record) | Order | Must-have | Foundational; PNR-compatible bridge during transition |
+| Inventory / availability | Offer/Order | Must-have | Real-time, high-throughput |
+| Offer management | Offer | Must-have | Core differentiator vs legacy |
+| Pricing & fares (filed + dynamic) | Offer | Must-have | Start filed, add dynamic |
+| Reservation & ticketing | Order | Must-have | e-ticket/EMD bridge to ONE Order |
+| B2C direct / IBE + mobile app | Offer | Must-have | First revenue surface |
+| Payments & settlement | Settle | Must-have | Orchestrated, multi-method |
+| Departure control / check-in (DCS) | Deliver | Must-have | Safety- and ops-critical |
+| Weight & balance / load control | Deliver | Must-have | Safety-critical; may integrate certified third party |
+| NDC distribution (OTA/TMC) | Offer/Order | High | Indirect reach + standards compliance |
+| B2B agent portal | Offer | High | Agency accounts, markups, commissions |
+| Corporate & SME booking | Offer | High | Negotiated fares, policy, billing |
+| Ancillaries & merchandising | Offer | High | Primary margin growth |
+| FFP / loyalty | Offer/Order | High | Build or integrate dedicated platform |
+| Reporting & BI | Cross-cutting | High | Operational, commercial, financial, regulatory |
+| IROPS / disruption handling | Deliver | High | Major CX & resilience lever |
+| Revenue management | Offer | High | Can integrate a specialist |
+| Conversational commerce (WhatsApp/chat) | Offer/Deliver | Medium | Feature on channel layer; reuses offer/order APIs |
+| Dynamic / AI pricing | Offer | Medium | Differentiator; can partner |
+| Customer data platform / personalisation | Offer | Medium | Grows in value with scale |
+| Cargo management | Adjacent | Integrate | Integrated-but-separate CMS; own the integration contract |
+| Interline / codeshare (order-based) | Order | Medium | Follows Future-of-Interline standards |
+
+## 5.8 Coverage of the requested component list
+
+The following maps each requested component to where it sits in this design, for traceability:
+
+| **#** | **Requested component** | **How it is addressed here** |
+| --- | --- | --- |
+| 02 | Fleet configuration & Schedule Management | Two explicit core capabilities (5.1): fleet/cabin configuration master data + schedule & flight management. |
+| 03 | Fares & Inventory | Core transactional services (5.1) and capability map: fares/pricing + inventory/availability. |
+| 04 | Reservation & Ticketing | Reservation/order + ticketing/document issuance (5.1); e-ticket/EMD bridge to ONE Order. |
+| 05 | DCS module | Operational delivery (5.3): check-in, seating, boarding, baggage. |
+| 06 | Reports | Standalone Reporting & BI module (5.5) on the analytics backbone. |
+| 07 | Weight & Balance (Load & Trim) | Operational delivery (5.3) + build/integrate note (8); fed by fleet configuration. |
+| 08 | Cargo Management | Integrated-but-separate Cargo Management System (5.6); programme owns the integration contract. |
+| 09 | FFP (Frequent Flyer Program) | FFP / loyalty capability (5.2): earn/burn, tiers, awards; build or integrate. |
+| 10 | Mobile App | B2C direct channel (5.4) and experience layer (6.2). |
+| 11 | IBE | B2C direct channel (5.4); first revenue surface in roadmap Phase 1. |
+| 12 | B2B, OTA, Corporate, SME, B2C | Sales channels & distribution (5.4): each broken out as a distinct surface on one offer/order core. |
+| 13 | WhatsApp services | Conversational commerce feature (5.4): WhatsApp Business API for booking, servicing, check-in, notifications. |
+
+# 6. Target System Design (Reference Architecture)
+
+## 6.1 Architecture principles
+
+- **Order-native, standards-aligned. **Model the Order as the primary record from day one; align to NDC and ONE Order. Maintain PNR/e-ticket compatibility as an explicit bridging layer, not as the core.
+
+- **API-first and modular. **Every capability is a service behind a well-defined API. Modules must be independently deployable and independently sellable.
+
+- **Cloud-native. **Containerised microservices, horizontal scalability, infrastructure-as-code, multi-AZ by default.
+
+- **Event-driven core. **An event/streaming backbone for state changes (orders, inventory, ops) enables real-time analytics, audit, and loose coupling.
+
+- **Resilience and data integrity above all. **Graceful degradation, idempotency, no single points of failure, strong consistency where money and seats are concerned.
+
+- **Coexistence by design. **Assume the platform will run alongside legacy systems for years; bridging and synchronisation are core features, not migration scripts.
+
+## 6.2 Logical layers
+
+A workable layering of the platform:
+
+- **Experience layer — **web IBE, mobile, kiosk, agent and airport apps; consume the same offer/order APIs.
+
+- **Channel ****&**** distribution layer — **API gateway, NDC endpoints, GDS adapters, partner/OTA connectors, BFF services per channel.
+
+- **Retailing layer — **offer management, pricing/optimisation, ancillaries/merchandising, personalisation.
+
+- **Order ****&**** fulfilment layer — **order management, servicing, ticketing/EMD bridge, delivery/DCS, baggage, load control.
+
+- **Core services layer — **inventory/availability, schedules, fares, payments & settlement, revenue accounting integration.
+
+- **Data ****&**** intelligence layer — **streaming backbone, data lake/warehouse, customer data platform, ML/AI feature and model services.
+
+- **Platform layer — **identity & access, secrets, observability, configuration/feature flags, audit, CI/CD.
+
+## 6.3 Technology & integration choices (illustrative, to be ratified)
+
+| **Concern** | **Indicative approach** |
+| --- | --- |
+| Compute / deployment | Containers + orchestration (Kubernetes), infra-as-code, multi-region/multi-AZ |
+| Service communication | REST/JSON + async events; gRPC for high-throughput internal paths |
+| Messaging / streaming | Durable event log (e.g. Kafka-class) for order/inventory/ops events |
+| Data stores | Polyglot: strongly-consistent store for orders/inventory; document store for offers; analytics warehouse + lake |
+| Standards / schemas | IATA NDC (current schema generation), ONE Order, EDIFACT/Type-B adapters for legacy interop |
+| APIs | OpenAPI-documented gateway; NDC-conformant external endpoints; partner sandbox |
+| AI / pricing | Pluggable optimisation services; option to integrate best-of-breed dynamic-pricing engines |
+| Security | Zero-trust, encryption in transit and at rest, tokenised payments (PCI DSS scope isolation) |
+
+*Technology choices are deliberately indicative — they are decisions for the architecture board, recorded here to frame the trade-offs.*
+
+# 7. Non-Functional Requirements
+
+For a PSS the non-functional requirements are the product. The following are the dimensions that must carry explicit, testable targets before build:
+
+| **Dimension** | **Requirement direction** |
+| --- | --- |
+| **Availability** | Core booking, check-in and DCS paths must target very high availability with graceful degradation; no single point of failure; tested failover. Outages translate directly into grounded flights. |
+| **Performance** | Sub-second shopping/availability responses at high look-to-book ratios; offer generation at scale; predictable latency under peak (holiday, IROPS surges). |
+| **Scalability** | Horizontal scale to traffic spikes; multi-tenant if serving multiple carriers; isolate noisy neighbours. |
+| **Data integrity** | Exactly-once financial and seat transactions; idempotency; strong consistency for inventory and orders; full auditability. |
+| **Security** | PCI DSS for payments; strong auth/authorisation; encryption everywhere; secrets management; intrusion detection. |
+| **Privacy ****&**** compliance** | GDPR and regional data-protection; passenger data residency; consent management; API/PNR data-sharing (e.g. API/PNR government requirements) handled correctly. |
+| **Observability** | End-to-end tracing, business and technical metrics, alerting, and replayable event history. |
+| **Recoverability** | Defined RPO/RTO; backups; disaster-recovery runbooks rehearsed, not just documented. |
+| **Interoperability** | Clean coexistence with legacy PSS, GDS and partner systems via standards-based adapters. |
+
+# 8. Build, Buy or Partner
+
+Not every component should be built. The capability map (5.6) and the market structure (3) point to a deliberate sourcing strategy:
+
+- **Build the differentiators: **order management, offer assembly, inventory/availability, and the API/distribution core — these define the platform and should be owned.
+
+- **Integrate or partner for specialised/regulated capabilities: **dynamic-pricing engines, weight-and-balance/load control (often certified third parties), payment orchestration, and potentially revenue management and loyalty — areas where best-of-breed specialists already exist.
+
+- **Bridge, don****'****t rebuild, the legacy: **treat PNR/e-ticket/EMD compatibility as adapters (mirroring the "PSS Sync"-style bridges incumbents ship) so the platform can coexist and migrate carriers incrementally.
+
+This sourcing posture also defines the realistic commercial entry point: the platform can be sold as a full suite to greenfield carriers (the Riyadh-Air-style "start clean on Offer & Order" pattern) or as individual modules into established carriers running multi-vendor strategies.
+
+# 9. Implementation Roadmap
+
+The roadmap is phased to deliver value early and de-risk continuously. Durations are indicative placeholders for planning, not commitments; each phase ends with a usable, sellable increment. Industry experience suggests full transformation programmes run multi-year — this plan front-loads a revenue-generating core and treats the move to fully native Offer & Order as an explicit later phase.
+
+| **Phase** | **Focus** | **Key deliverables** | **Indicative window** |
+| --- | --- | --- | --- |
+| **Phase 0 — Discovery ****&**** foundations** | De-risk and set foundations | Architecture decisions ratified; standards baseline (NDC/ONE Order); platform layer (CI/CD, IAM, observability); domain model for Order; test/simulation harness. | 0–3 mo |
+| **Phase 1 — Core MVP** | Sell a flight | Order management (order-native + PNR bridge), inventory/availability, filed-fare pricing, direct IBE/mobile, payments, e-ticket/EMD bridge. A carrier can shop, book, pay. | 3–9 mo |
+| **Phase 2 — Retailing ****&**** distribution** | Sell more, everywhere | Offer management, ancillaries/merchandising, NDC distribution (OTA/TMC), B2B agent portal, Corporate & SME booking, FFP/loyalty, WhatsApp conversational commerce, reporting & BI, GDS adapters. | 9–18 mo |
+| **Phase 3 — Delivery ****&**** operations** | Fly the passenger | DCS (check-in, seating, boarding), baggage, IROPS/disruption, weight-and-balance, Cargo (CMS) integration, settlement & revenue-accounting integration. | 15–24 mo |
+| **Phase 4 — Native Offer ****&**** Order + AI** | Lead, don't follow | Full ONE Order native fulfilment, dynamic/continuous pricing, AI personalisation, settlement-with-orders, order-based interline; retire legacy bridges per carrier. | 24–42 mo |
+
+*Phases overlap deliberately; windows are planning placeholders to be replaced with estimated effort once scope is fixed.*
+
+## 9.1 Sequencing logic
+
+- Ship a revenue surface (Phase 1) before breadth — a carrier should be able to sell a ticket on the platform as early as possible.
+
+- Defer the hardest operationally-critical, safety-adjacent pieces (DCS, weight & balance) until the commercial core is proven and stable.
+
+- Keep the legacy bridge alive throughout so adoption never requires a big-bang cutover.
+
+- Treat full native Offer & Order as a destination reached incrementally, not a prerequisite for launch.
+
+# 10. Risks and Mitigations
+
+PSS programmes are high-stakes: a PSS is effectively a transplant of an airline's vital systems, and migrations carry hundreds of catalogued risk types. Incumbent migration practices stress structured, multi-stage testing (component through end-to-end business-process), dress rehearsals, parallel running and disciplined cutover with on-the-ground post-go-live support. The table below captures the principal risks and the design/process responses.
+
+| **Risk** | **Mitigation** |
+| --- | --- |
+| Operational disruption (downtime, glitches grounding flights) | High-availability design, graceful degradation, parallel running, rehearsed cutover, dedicated post-go-live support window. |
+| Data migration errors / loss (future bookings, history, preferences) | Rigorous data mapping and reconciliation, dual-run validation, rollback plan, bridge that keeps legacy authoritative until proven. |
+| Distribution continuity (e.g. losing GDS/channel access mid-transition) | Maintain GDS/NDC adapters and dual distribution through transition; contractual continuity with channels. |
+| Underestimated scope & cost (multi-year, tens of millions per carrier) | Phased delivery with value at each stage; explicit scope gates; reuse partners for non-differentiators. |
+| Codeshare / interline / partner breakage | Standards conformance (NDC, ONE Order, Future of Interline); partner test environments; staged enablement. |
+| Organisational misalignment / silos | Cross-functional governance forums; clear ownership; commercial + IT + ops aligned from Phase 0. |
+| Vendor / standards drift (schema versions evolve) | Track IATA schema generations; abstract standards behind adapters; automated conformance testing. |
+| Big-bang temptation | Architecturally enforce modularity and coexistence so incremental adoption is always the cheaper path. |
+
+# 11. Open Questions for the Team
+
+These decisions materially shape scope, cost and architecture and should be resolved before detailed design:
+
+- Target customer: greenfield/new carriers (start clean on Offer & Order), established carriers migrating, or a module strategy into multi-vendor estates? This drives everything below.
+
+- Carrier type focus: full-service, low-cost, hybrid, or multi-tenant across types? (LCC vs FSC priorities differ sharply on ancillaries, interline and complexity.)
+
+- Full-suite vs best-of-breed modules: which capabilities do we commit to building vs integrating/partnering (see Section 8)?
+
+- Geography & compliance footprint: which regions first, and therefore which data-residency, payment and government-data regimes apply?
+
+- Migration posture: are we offering a managed migration/coexistence service, or a clean-start platform only?
+
+- AI/dynamic pricing: build, buy or partner — and how central is it to the value proposition?
+
+- Commercial model: licence, SaaS subscription, transaction-based, or hybrid?
+
+# 12. Appendix
+
+## 12.1 Glossary
+
+| **Term** | **Meaning** |
+| --- | --- |
+| PSS | Passenger Service System — the airline's reservation, inventory and departure-control core. |
+| CRS | Central Reservation System — schedules, fares, bookings, PNRs. |
+| ICS / AIS | Inventory (Control) System — sellable seats by flight and class. |
+| DCS | Departure Control System — check-in, boarding, baggage, load control. |
+| PNR | Passenger Name Record — legacy booking record. |
+| EMD | Electronic Miscellaneous Document — issuance for ancillaries/services. |
+| RBD | Reservation Booking Designator — booking class/fare bucket. |
+| NDC | New Distribution Capability — IATA Offer/Order distribution data standard. |
+| ONE Order | IATA standard consolidating PNR/e-ticket/EMD into a single Order record. |
+| OOSD | Offer, Order, Settle, Deliver — the modern-retailing framework. |
+| MAR | Modern Airline Retailing — IATA programme toward 100% Offers and Orders. |
+| GDS | Global Distribution System — intermediary distribution networks (e.g. Amadeus, Sabre, Travelport). |
+| IBE | Internet Booking Engine — the airline's direct online sales surface. |
+| FFP | Frequent Flyer Program — the airline's loyalty programme. |
+| CMS | Cargo Management System — dedicated cargo platform, integrated with the PSS. |
+| AWB | Air Waybill — the cargo equivalent of a ticket/contract of carriage. |
+| OTA / TMC | Online Travel Agency / Travel Management Company — indirect sales intermediaries. |
+| IROPS | Irregular Operations — disruption handling and re-accommodation. |
+
+## 12.2 Primary sources consulted
+
+This document synthesises publicly available material (June 2026), including IATA programme pages on Modern Airline Retailing, NDC and ONE Order; vendor materials for Amadeus Nevio, Sabre SabreMosaic, Accelya FLX ONE and Hitit Oxygen; PSS market analyses; and industry commentary on migration practice. Specific figures (market size, adoption rates, investment ranges) vary by source and should be re-validated before being used in any business case.
+
+| **Source** | **Reference** |
+| --- | --- |
+| IATA — Modern Airline Retailing / NDC / ONE Order | iata.org/en/programs/airline-distribution/retailing/ |
+| AltexSoft — PSS and airline reservation systems explainers | altexsoft.com |
+| Sabre — SabreMosaic announcements | sabre.com |
+| Amadeus — Nevio / PSS migration insights | amadeus.com |
+| Accelya — FLX ONE / OOSD guide | accelya.com |
+| Mordor Intelligence / Credence / Business Research Insights — PSS market | mordorintelligence.com |
+| Coforge / Hitit — PSS migration practice | coforge.com / hitit.com |
+
+*Note on figures: market-size and adoption statistics differ substantially between analysts because of differing scope definitions. Treat all quantitative claims here as directional inputs to be confirmed, not settled facts.*
+
+	Confidential — internal working document	Page  of

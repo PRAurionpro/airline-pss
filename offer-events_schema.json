@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.pss/aurionpro/offer/offer-events.schema.json",
+  "title": "Offer module domain events",
+  "description": "Published domain events for the Offer module (Offer LLD §8). Offer is a synchronous read-path module, so its eventing is minimal. Every event shares the common envelope; the concrete event is selected by the 'type' constant. Consumers MUST be idempotent on eventId.",
+  "$defs": {
+    "Ulid": {
+      "type": "string",
+      "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$",
+      "description": "ULID identifier."
+    },
+    "Currency": {
+      "type": "string",
+      "pattern": "^[A-Z]{3}$",
+      "description": "ISO-4217 currency code."
+    },
+    "EnvelopeBase": {
+      "type": "object",
+      "required": ["eventId", "type", "version", "tenantId", "offerId", "occurredAt"],
+      "properties": {
+        "eventId": { "$ref": "#/$defs/Ulid", "description": "Unique event id; idempotency key for consumers." },
+        "type": { "type": "string", "description": "Event type discriminator." },
+        "version": { "type": "integer", "minimum": 1, "description": "Schema version of this event type." },
+        "tenantId": { "type": "string", "description": "Owning tenant." },
+        "offerId": { "$ref": "#/$defs/Ulid", "description": "The offer this event concerns." },
+        "occurredAt": { "type": "string", "format": "date-time" },
+        "correlationId": { "type": "string", "description": "End-to-end correlation id for tracing." },
+        "causationId": { "type": "string", "description": "Id of the command/event that caused this one." }
+      }
+    },
+    "OfferCreated": {
+      "allOf": [{ "$ref": "#/$defs/EnvelopeBase" }],
+      "required": ["payload"],
+      "properties": {
+        "type": { "const": "OfferCreated" },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["currency", "totalAmount", "validUntil"],
+          "properties": {
+            "currency": { "$ref": "#/$defs/Currency" },
+            "totalAmount": { "type": "number" },
+            "validUntil": { "type": "string", "format": "date-time" },
+            "quoteRef": { "$ref": "#/$defs/Ulid" },
+            "itemCount": { "type": "integer", "minimum": 1 }
+          }
+        }
+      }
+    }
+  },
+  "oneOf": [
+    { "$ref": "#/$defs/OfferCreated" }
+  ]
+}

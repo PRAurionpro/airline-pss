@@ -1,0 +1,279 @@
+PSS Platform — Handover Document
+
+**PSS PLATFORM**
+
+Project Handover Document
+
+Aurionpro Airline Passenger Service System
+
+Demo tenant: Airline A  ·  Repository: babakghf/pss-platform
+
+**Date: **07 July 2026
+
+**Prepared for: **Incoming software team
+
+**Prepared by: **[Your name / handover owner]
+
+*This document orients a new team taking over active development. It is a companion to the repository**'**s own living documentation, not a replacement for it — the repository remains the source of truth.*
+
+# **1. ****Executive Summary**
+
+PSS is a modern, multi-tenant **Airline Passenger Service System** — the software that lets an airline sell, distribute, and operate flights. It covers the full lifecycle: **shop → price → book → pay** (direct and via travel agents/NDC), **distribute** (corporate travel, loyalty, WhatsApp commerce), and **operate** (check-in and departure control). It is built by Aurionpro as a licensable platform product, demoed under a symbolic tenant carrier called **“Airline A.”**
+
+The system is architected as ~15 independent microservices around an event backbone, with contract-first APIs, automated governance checks in CI, and a disciplined build history recorded in Architecture Decision Records (ADRs). **The functional platform — Phase 1 (core retail) and Phase 2 (retailing ****&**** distribution) of the product roadmap — is complete and ratified closed.**
+
+Since then, the project has been in a **“Demo Product” program**: turning a functionally-complete but API-only/curl-driven system into a polished, brand-consistent, click-through product experience suitable for a live client demonstration. **Three of six planned workstreams are complete; the remainder are scoped and queued.** This document exists to hand that work, and everything behind it, to your team.
+
+**Bottom line: **nothing is broken or blocked. Two pull requests are built, tested, and awaiting a final human click-through before merge. The next unit of work (Workstream 3) is fully scoped in the repository’s own build plan and ready to start.
+
+# **2. ****Project Overview**
+
+## **What the platform does**
+
+The platform is organised around these functional domains, each its own service with its own database, contract, and event stream:
+
+- **Offer / Order / Inventory / Pricing** — the retail core: search, price, hold seats, book.
+
+- **Payments** — real Razorpay sandbox integration (cards, UPI, netbanking), refunds, webhook-driven settlement.
+
+- **Distribution** — NDC seller API for travel agents/OTAs; Corporate & SME policy-based booking.
+
+- **Loyalty** — frequent-flyer enrolment, earn, tier, redeem.
+
+- **DCS** (Departure Control) — check-in, seat assignment, boarding pass, boarding.
+
+- **Revenue Management** — authorisation-unit forecasting and recommendation (compute-only — see §5).
+
+- **CDP / Personalisation** — consent-gated offer ranking by customer profile.
+
+- **Conversational Commerce** — WhatsApp-style keyword check-in.
+
+- **Reporting ****&**** Dashboard** — live operational KPIs and BI read-models.
+
+## **Architecture principles**
+
+- **Event-sourced backbone** — services communicate over Kafka/Redpanda; each publishes a versioned, schema-governed event stream.
+
+- **Contract-first** — every service ships a validated OpenAPI spec and (where applicable) a JSON Schema event contract under docs/contracts/. A CI fitness function fails the build if any registered service lacks one.
+
+- **Ports ****&**** adapters** — external vendors (PSP, GDS, Weight & Balance, government data) sit behind ports with conformance suites, so real adapters can be swapped in without touching core logic.
+
+- **Multi-tenant, config-over-code** — a new airline tenant is configuration, not a code fork. The demo’s two-level branding (Aurionpro platform / Airline A tenant) exists specifically to make this visible.
+
+- **Governed by ADRs and fitness functions** — 12 automated checks run in CI (tenant isolation, no cross-module DB access, contract presence, etc.); architectural decisions are recorded, not tribal knowledge.
+
+- **“Real counterparty” testing rule** — a cross-service integration is not considered proven until at least one test exercises the real downstream service, not a mock. This rule exists because several real defects were only found when it was applied (see §5).
+
+## **Repository and stack**
+
+|  |  |
+| --- | --- |
+|  |  |
+|  |  |
+|  |  |
+|  |  |
+|  |  |
+|  |  |
+|  |  |
+
+# **3. ****Current Status at a Glance**
+
+| **Phase** | **Scope** | **Status** |
+| --- | --- | --- |
+| Phase 0–1 — Foundations & Core MVP | Paved road, event backbone, core shop→book→pay walking skeleton | **COMPLETE** |
+| Phase 2 — Retailing & Distribution | Ancillaries, NDC, Corporate, Loyalty, WhatsApp, Reporting, RM, CDP | **COMPLETE — ratified** |
+| Demo Readiness | Full-platform dry-run, all scenes proven or knowingly deferred | **COMPLETE** |
+| Demo Product Program | Branded, click-through product experience (W0–W5) | **IN PROGRESS (3/6)** |
+
+**Governance snapshot: **15/15 services carry a validated contract (0 exemptions) · 12/12 automated fitness functions passing · 3 Architecture Decision Records on file (one “Proposed,” awaiting Workstream 3) · latest platform tag v0.4.0-phase2-close.
+
+# **4. ****Detailed Task Status**
+
+## **4.1  Platform foundation ****&**** Phase 2 (complete)**
+
+All Phase 2 roadmap deliverables were reconciled against the original scope and formally ratified closed. Two items were consciously not built and are backlog, not gaps:
+
+| **Deliverable** | **Status** | **Note** |
+| --- | --- | --- |
+| Offer, Order, Inventory, Pricing, Payments | Built — full | Core retail loop, real PSP |
+| Ancillaries (seats, bags) | Built | Server-ratified pricing |
+| NDC distribution | Built — thin | Payment step and real GDS/interline adapters not yet built |
+| Corporate & SME booking | Built — thin | Policy engine present; budget cap is informational only until Workstream 3’s fix lands |
+| Loyalty (FFP) | Built — thin | Voucher-stub redemption; “pay with miles” stubbed behind a port |
+| WhatsApp conversational commerce | Built — thin | Keyword flow, no NLP |
+| Reporting & BI | Built — thin | Read-side projection, telemetry-grade |
+| Revenue Management | Built — thin | Computes recommendations; never writes to inventory (see §5) |
+| Personalisation / CDP | Built — thin | Consent-gated ranking, wired into shopping |
+| DCS (departure control) | Built — thin | Check-in through boarding; Weight & Balance is a simulator port |
+| B2B agent portal | **Not built** | Backlog / candidate for a later phase |
+| GDS adapters | **Not built** | Backlog / candidate for a later phase; deliberately fenced out of CI |
+
+## **4.2  Demo Readiness (complete)**
+
+A full rehearsal of the platform against a realistic demo scenario, run end-to-end before any UI polish began. 13 of 14 scripted scenes passed; one was cut with a precisely diagnosed, documented cause rather than papered over.
+
+- **Passed: **core retail (search through refund), personalisation, NDC booking, DCS check-in/boarding, WhatsApp check-in, loyalty earn/redeem, revenue management compute.
+
+- **Cut: **Corporate Travel end-to-end booking — root-caused to a cross-service identity gap between Corporate and Distribution (see ADR-0003, §5 and §6). Not a demo blocker; the fix is scoped as the first task of Workstream 3.
+
+## **4.3  Demo Product Program (in progress — the current work)**
+
+The governing document is docs/BUILD_PLAN_DEMO_PRODUCT.md in the repository — read this first. It defines six workstreams (W0–W5), a shared branding model, and a final gate (“DR5”, a portal-edition dry-run) before the platform is declared demo-schedulable.
+
+| **WS** | **Scope** | **Status** | **Reference** |
+| --- | --- | --- | --- |
+| W0 | Aurionpro / Airline A branding, landing page, one-origin gateway | **COMPLETE** | PRs #89, #91 |
+| W1 | Customer portal: search→book→pay, persona ranking, manage booking, online check-in | **COMPLETE** | PRs #90, #92, #93 |
+| W2 | Carrier console: live KPIs, reports, revenue mgmt, flights | **Built — pending merge** | PR #95, canonical plan in #94 |
+| W3 | Trade portal (NDC agent + Corporate) + seller-identity architecture fix | **QUEUED — next** | Needs ADR-0003 ratified first |
+| W4 | Engagement: WhatsApp mock + loyalty member portal | **QUEUED** | — |
+| W5 | Airport workstation: full DCS check-in desk | **QUEUED** | — |
+| — | Demo script v3 + DR5 gate (final portal-edition dry-run) | **QUEUED — after W5** | Program exit gate |
+
+**Immediately pending: **PR #95 (Workstream 2) and PR #96 (a real payments-service defect found and fixed during W1 verification — see §5) are both built, automated-tested, and green. Both are held for one final human click-through against a real payment before merge — this is a standing rule on this project (§7.7), not a sign of a problem.
+
+# **5. ****Known Issues ****&**** Carried Technical Debt**
+
+These are tracked, not hidden. None currently blocks demo scheduling; each has an owner-decided disposition.
+
+| **Item** | **Impact** | **Disposition** |
+| --- | --- | --- |
+| Corporate ↔ Distribution seller identity is unresolved (ADR-0003, “Proposed”) | Corporate Travel cannot complete a real booking end-to-end (this is the Demo Readiness “cut” scene) | Scoped as Workstream 3’s first task — ratify the ADR, then implement |
+| Payments refund: a PSP business rejection (e.g. an id Razorpay doesn’t recognise) could surface as a raw 500 | A real cancel-after-real-payment could fail ungracefully | Fixed in PR #96 (routes to a clean REFUND_FAILED state); awaiting final live verification |
+| Distribution: an unknown seller ID returns HTTP 500 rather than a clean 4xx | Minor — poor error ergonomics only | Bundle with the ADR-0003 fix in Workstream 3 |
+| BFF returns 500 (not 401) on missing/invalid auth | Minor — error ergonomics only | Backlog, not urgent |
+| CDP ranking call has a tight (~400ms) cold-start timeout | First personalised search after a cold start can silently fall back to unranked | Mitigated: the demo seed script performs a warm-up call. Revisit the timeout value later. |
+| Five thin-slice services log plain text instead of structured JSON | Cosmetic — harder to grep in aggregate log tooling | Backlog, cosmetic |
+| A specific CI integration-test flake (cold-container race in Testcontainers) has recurred 3 times, each individually guarded | None currently — all known instances are guarded | If a 4th instance appears, stop guarding one-by-one and split/serialise the heavy CI job instead |
+| Local real-payment testing needs an ngrok tunnel and a correctly-scoped Razorpay Dashboard webhook (specific event types, no duplicate webhook entries) | Easy to misconfigure; a missing tunnel makes checkout hang silently with no error | Documented as a standing pre-demo checklist item — see §7.4 |
+
+# **6. ****Roadmap**
+
+## **6.1  Immediate — finishing the Demo Product program**
+
+This is the team’s first work. In order:
+
+- Click through and merge PR #95 (Workstream 2) and PR #96 (payments refund fix).
+
+- Ratify ADR-0003 (corporate↔distribution seller identity), then build Workstream 3 — the Trade portal and the identity fix. This re-enables the Corporate Travel scene cut during Demo Readiness.
+
+- Build Workstream 4 (WhatsApp mock + loyalty member portal) and Workstream 5 (full DCS airport workstation).
+
+- Rewrite the demo script for the finished product (“v3”), then run DR5 — a full click-through dry-run of every persona portal on the real demo stack, including a real Razorpay payment.
+
+- A green DR5 is the gate: at that point the platform is formally schedulable for the client demonstration.
+
+## **6.2  After the demo — Phase 3: Delivery ****&**** Operations**
+
+This is the next major phase of the *original platform roadmap* (independent of the Demo Product program above). Phase 2 deliberately deferred the operationally hardest, safety-adjacent work until the commercial core was proven:
+
+- **DCS depth** — the thin check-in→boarding slice becomes a full departure-control module, including real seating rules.
+
+- **Weight ****&**** Balance** — today a simulator behind a port; this phase brings a real adapter behind the same conformance suite.
+
+- **Baggage** and **IROPS / disruption handling**.
+
+- **Settlement ****&**** revenue-accounting integration.**
+
+- **Cargo (CMS) integration.**
+
+*Note: *ADR-0002 (flight-class identity) named the platform’s canonical cross-service identity but deliberately deferred implementing it. Its stated trigger is exactly this phase — the first Weight & Balance or IROPS work should implement it, not defer further.
+
+## **6.3  Longer-term — Phase 4: Native Offer ****&**** Order + AI**
+
+The platform roadmap's final phase, for context: full IATA ONE Order native fulfilment, dynamic/continuous pricing, AI-driven personalisation at scale, order-based interline agreements, and retirement of legacy PNR-bridge compatibility per carrier as each is ready. Not near-term — included here so the team has the full picture, not just the next sprint.
+
+# **7. ****Handover: Repository, Access ****&**** Environment**
+
+## **7.1  Repository access**
+
+Repository: https://github.com/babakghf/pss-platform (private).
+
+- Recommended sequence: add the incoming team as collaborators first, have them do a clean clone and a successful local build (§7.4), **then** transfer repository ownership. This avoids any access gap mid-transfer.
+
+- The team should work from a fresh clone and the repository’s own documentation, rather than relying on any local uncommitted state on the outgoing owner’s machine.
+
+## **7.2  Credentials ****&**** secrets — transfer out-of-band**
+
+**Do not transfer secrets via email, chat, or this document.** Use a password manager or secrets vault your organisation already trusts. The following exist and need transfer:
+
+- **.env** (repository root, not committed) — Razorpay sandbox API key, secret, and webhook secret.
+
+- **Razorpay Dashboard access** (test mode) — needed to view/edit the webhook configuration described in §7.4.
+
+- **ngrok account** — free tier, used to tunnel the local payments webhook for real end-to-end payment testing. A reserved subdomain is currently in use; confirm whether it transfers with the account or needs re-pointing in the Razorpay dashboard.
+
+## **7.3  Where to start reading, in order**
+
+- README.md — repository root.
+
+- LATEST_STATUS.md — the living status file. Read this first in every session; it is kept current by design.
+
+- docs/BUILD_PLAN_DEMO_PRODUCT.md — the canonical, current plan. Workstreams 3–5 are fully specified here.
+
+- docs/adr/ — ADR-0001 (how decisions are recorded), ADR-0002 (flight-class identity), ADR-0003 (seller identity, Proposed — needs ratifying to start Workstream 3).
+
+- DEMO_SCRIPT.md and docs/dr4/DR4_RESULTS.md — the rehearsed demo scenario and its last verified run.
+
+- docs/contracts/ — every service’s OpenAPI + event-schema contract; the source of truth for any integration.
+
+## **7.4  Local environment setup**
+
+**Prerequisites: **Docker Desktop, JDK 21, and the included Gradle wrapper (no separate Gradle install needed).
+
+**Build: **
+
+cd platform && ./gradlew build
+
+**Run the demo stack: **
+
+docker compose -f docker-compose.demo.yml -f docker-compose.demo-full.yml up -d
+
+./scripts/demo-reset-full.sh   # seeds demo data, runs a smoke booking
+
+**Entry point once running: **http://localhost:8093/ — the branded landing page.
+
+## **7.5  Environment gotchas worth knowing on day one**
+
+- **Static UI assets are baked into service JARs at build time.** A source change to a page under a service’s static/ folder requires rebuilding that service’s JAR and recreating its container — restarting the container alone serves the old code.
+
+- **The demo gateway’s nginx config is a bind-mounted file from the working tree.** Its content depends on which git branch is checked out when the container starts — switching branches with the stack already running can silently serve a stale config. Recreate the ibe-gateway container after any branch switch that touches gateway config.
+
+- **Windows / Git Bash path handling: **commands with a leading-slash path (e.g. docker exec <container> cat /etc/...) can be silently rewritten to a Windows path by Git Bash. Wrap the command in sh -c "..." or prefix with MSYS_NO_PATHCONV=1 when this happens.
+
+- **Real end-to-end payment testing needs three things simultaneously: **(1) ngrok http 8086 running and left open, (2) the Razorpay Dashboard webhook pointed at that tunnel’s URL and **Enabled** (confirm there is only one such webhook — a duplicate caused real confusion once), and (3) that webhook subscribed to at least payment.authorized, payment.captured, refund.processed, refund.failed. Without a live tunnel, checkout hangs on “Confirming your booking…” indefinitely with no error shown — check this first if that happens.
+
+## **7.6  Continuing with AI-assisted development**
+
+This project was built through paired sessions between a human operator and Claude Code (an agentic coding tool that works directly in the repository), with a separate Claude.ai project used for planning, prompt-writing, and review. If your team continues this pattern:
+
+- docs/claude-project-sync/ is a folder maintained specifically to be uploaded into a Claude.ai project’s knowledge base, so AI-assisted planning stays grounded in the actual current repository state rather than a stale memory of it.
+
+- The standing engineering rules this project follows — contract-first, the real-counterparty testing rule, “stop-and-flag” on any ambiguity rather than improvising, one PR per unit of work with an explicit human verification step before merge — are stated in docs/BUILD_PLAN_DEMO_PRODUCT.md and should be carried forward regardless of tooling.
+
+- **The single most important habit from this project: **verify UI and integration changes by actually clicking through them in a browser against a live payment/booking, not by trusting a green CI status or an HTTP 200 alone. Several real defects in this codebase were invisible to every automated check and were only found this way.
+
+## **7.7  What needs your attention first**
+
+- Review and merge PR #95 and PR #96 (both green, both awaiting one live click-through — see §4.3).
+
+- Read ADR-0003 and ratify or amend it — this unblocks Workstream 3.
+
+- Proceed through Workstreams 3–5 and DR5 per docs/BUILD_PLAN_DEMO_PRODUCT.md.
+
+# **8. ****Glossary**
+
+| **Term** | **Meaning** |
+| --- | --- |
+| PSS | Passenger Service System — the airline software category this platform is. |
+| PNR | Passenger Name Record / booking reference — the code a customer uses to look up a booking. |
+| NDC | New Distribution Capability — IATA’s API standard for travel-agent distribution. |
+| ADR | Architecture Decision Record — a written, dated record of a significant design decision and its rationale. |
+| Fitness function | An automated check that runs in CI to enforce an architectural rule (e.g. “no service may call another service’s database directly”). |
+| Thin slice | A deliberately minimal but real, end-to-end implementation of a feature — proves the architecture without building every edge case up front. |
+| Real-counterparty rule | The project’s standing rule that a cross-service integration isn’t proven until a test exercises the real downstream service, not a mock/stub. |
+| W0–W5 | The six workstreams of the Demo Product program — see §4.3. |
+| DR4 / DR5 | “Demo Readiness” and “Demo Product” dry-run gates — full rehearsals of the platform before it is declared ready to show a client. |
+| Compute-only | Describes Revenue Management’s current behaviour: it computes and displays a recommendation but never writes it back to Inventory. This is deliberate and stated on-screen, not a bug. |
+
+Page  of

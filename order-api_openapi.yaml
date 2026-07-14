@@ -1,0 +1,565 @@
+openapi: 3.0.3
+info:
+  title: PSS Order Module API
+  version: "1.0.0-draft"
+  description: >
+    ONE Order-conformant API for the Order module of the Aurionpro PSS platform.
+    The Order is the single, authoritative record of what a customer bought.
+    This contract realises the operations in the Order Module Low-Level Design (§5).
+
+    Conventions:
+      * Tenant context is derived from the verified bearer token (tenant claim); there is
+        no tenant path/query parameter. A request without tenant context is rejected.
+      * Every state-changing operation requires an Idempotency-Key header; a repeated key
+        returns the original result rather than acting twice.
+      * ChangeOrder and CancelOrder are optimistically concurrency-controlled via ETag /
+        If-Match; a stale version is rejected with 409.
+      * Errors use the problem+json model (RFC 9457).
+
+    Provisional choices pending residual decisions (LLD §14): orderRef format,
+    pinned ONE Order/NDC schema generation, default hold TTL. These are marked PROVISIONAL.
+  contact:
+    name: Aurionpro Solutions Limited — PSS Platform
+    url: https://www.aurionpro.com
+
+servers:
+  - url: https://{host}
+    description: Gateway base URL (region-specific; India regions first)
+    variables:
+      host:
+        default: api.pss.local
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Orders
+    description: Create, retrieve, change and cancel orders.
+
+paths:
+  /v1/orders:
+    post:
+      tags: [Orders]
+      operationId: createOrder
+      summary: Create an order from a selected offer
+      description: >
+        Validates the offer against Offer and Inventory, persists the order as CREATED,
+        places the inventory hold and starts the book-pay-fulfil saga. Does not block on
+        payment completion. Maps to the ONE Order OrderCreate message family.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOrderRequest'
+            examples:
+              air-one-pax:
+                summary: One adult, one air item, UPI payment intent
+                value:
+                  offerRef: OFR_01HZX8N2QE
+                  passengers:
+                    - ref: P1
+                      ptc: ADT
+                      givenName: A
+                      surname: Rao
+                      document:
+                        type: PASSPORT
+                        number: "<tokenized>"
+                  contact:
+                    email: a@example.com
+                    phone: "+919900000000"
+                    consent: true
+                  payment:
+                    intentRef: PI_01HZX8N3RT
+                    method: UPI
+      responses:
+        '201':
+          description: Order created (CREATED, pending payment).
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+            Location:
+              description: Canonical URL of the created order.
+              schema: { type: string, format: uri }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+              examples:
+                created:
+                  value:
+                    orderId: 01HZX8N4S0
+                    orderRef: AB12CD
+                    status: CREATED
+                    currency: INR
+                    totalAmount: 5499.00
+                    amountPaid: 0
+                    balanceDue: 5499.00
+                    offerRef: OFR_01HZX8N2QE
+                    items:
+                      - orderItemId: 01HZX8N4S1
+                        type: AIR
+                        status: ORDERED
+                        passengerRef: P1
+                        segmentRef: SEG_7HJK
+                        price: { amount: 5499.00, currency: INR }
+                    version: 1
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+    get:
+      tags: [Orders]
+      operationId: listOrders
+      summary: List orders for the tenant
+      description: Cursor-paginated list with optional filters. Read-optimised.
+      parameters:
+        - $ref: '#/components/parameters/PassengerQuery'
+        - $ref: '#/components/parameters/StatusQuery'
+        - $ref: '#/components/parameters/CursorQuery'
+        - $ref: '#/components/parameters/LimitQuery'
+      responses:
+        '200':
+          description: A page of orders.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderList'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v1/orders/{orderId}:
+    parameters:
+      - $ref: '#/components/parameters/OrderIdPath'
+    get:
+      tags: [Orders]
+      operationId: getOrder
+      summary: Retrieve an order
+      description: Returns the order if visible to the tenant. Maps to OrderRetrieve.
+      responses:
+        '200':
+          description: The order.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/orders/{orderId}/changes:
+    parameters:
+      - $ref: '#/components/parameters/OrderIdPath'
+    post:
+      tags: [Orders]
+      operationId: changeOrder
+      summary: Add, cancel or exchange an order item
+      description: >
+        Applies a change and reprices deterministically. Requires the current ETag via
+        If-Match. Maps to the ONE Order OrderChange message family. In Phase 1 only
+        ADD_ITEM and CANCEL_ITEM are implemented; EXCHANGE_ITEM is designed but deferred.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+        - $ref: '#/components/parameters/IfMatchHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChangeOrderRequest'
+            examples:
+              add-bag:
+                summary: Add a checked-bag ancillary
+                value:
+                  operation: ADD_ITEM
+                  item:
+                    type: ANCILLARY
+                    productRef: BAG_20KG
+                    passengerRef: P1
+      responses:
+        '200':
+          description: Change applied; updated order returned.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+
+  /v1/orders/{orderId}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/OrderIdPath'
+    post:
+      tags: [Orders]
+      operationId: cancelOrder
+      summary: Cancel the whole order
+      description: >
+        Pre-payment releases the inventory hold; post-payment applies fare rules and
+        triggers a refund via Payments, then emits OrderCancelled. Maps to OrderCancel.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+        - $ref: '#/components/parameters/IfMatchHeader'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CancelOrderRequest'
+      responses:
+        '200':
+          description: Order cancelled; updated order returned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >
+        OAuth2/OIDC access token. The tenant is taken from a verified claim in the token;
+        there is no tenant path or query parameter. RBAC/ABAC is enforced per operation.
+
+  parameters:
+    OrderIdPath:
+      name: orderId
+      in: path
+      required: true
+      description: Internal order identifier (ULID).
+      schema:
+        $ref: '#/components/schemas/Ulid'
+    IdempotencyKeyHeader:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Client-generated key making the operation safe to retry.
+      schema: { type: string, minLength: 8, maxLength: 64 }
+    IfMatchHeader:
+      name: If-Match
+      in: header
+      required: true
+      description: The current ETag (order version) for optimistic concurrency.
+      schema: { type: string }
+    PassengerQuery:
+      name: passenger
+      in: query
+      required: false
+      description: Filter by passenger surname or document reference.
+      schema: { type: string }
+    StatusQuery:
+      name: status
+      in: query
+      required: false
+      schema:
+        $ref: '#/components/schemas/OrderStatus'
+    CursorQuery:
+      name: cursor
+      in: query
+      required: false
+      description: Opaque pagination cursor returned by a previous page.
+      schema: { type: string }
+    LimitQuery:
+      name: limit
+      in: query
+      required: false
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+
+  headers:
+    ETag:
+      description: The order version, used as the optimistic-concurrency token.
+      schema: { type: string }
+
+  responses:
+    BadRequest:
+      description: Validation failure (malformed payload, unknown PTC, missing consent).
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Unauthorized:
+      description: Missing or invalid authorisation / tenant context.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Forbidden:
+      description: Authenticated but not permitted for this operation or tenant.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    NotFound:
+      description: Order or referenced entity not visible to the tenant.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Conflict:
+      description: Stale ETag/version, or duplicate non-idempotent submission.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Unprocessable:
+      description: Offer no longer valid, inventory unavailable at confirm, or payment declined.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    ServiceUnavailable:
+      description: Transient downstream failure; safe to retry with the same Idempotency-Key.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+  schemas:
+    Ulid:
+      type: string
+      description: ULID identifier.
+      pattern: '^[0-9A-HJKMNP-TV-Z]{26}$'
+      example: 01HZX8N4S0ABCDEFGHJKMNPQRS
+    OrderRef:
+      type: string
+      description: External single reference (ONE Order). PROVISIONAL format (LLD §14).
+      pattern: '^[A-Z0-9]{6}$'
+      example: AB12CD
+    Currency:
+      type: string
+      description: ISO-4217 currency code.
+      pattern: '^[A-Z]{3}$'
+      example: INR
+    Money:
+      type: object
+      required: [amount, currency]
+      properties:
+        amount:
+          type: number
+          description: Decimal amount; server enforces currency precision.
+          example: 5499.00
+        currency:
+          $ref: '#/components/schemas/Currency'
+    TaxComponent:
+      type: object
+      required: [code, amount]
+      properties:
+        code: { type: string, description: 'Tax/levy code (e.g. GST, K3).', example: GST }
+        amount: { $ref: '#/components/schemas/Money' }
+    OrderStatus:
+      type: string
+      enum: [CREATED, CONFIRMED, IN_DELIVERY, FULFILLED, CLOSED, CANCELLED, EXPIRED]
+    OrderItemType:
+      type: string
+      enum: [AIR, ANCILLARY, SERVICE]
+    OrderItemStatus:
+      type: string
+      enum: [ORDERED, CONFIRMED, TICKETED, DELIVERED, CANCELLED, EXCHANGED, REFUNDED]
+    Ptc:
+      type: string
+      description: IATA passenger type code.
+      enum: [ADT, CHD, INF]
+    PaymentMethod:
+      type: string
+      enum: [UPI, RUPAY, CARD, NETBANKING]
+    TravelDocument:
+      type: object
+      required: [type, number]
+      properties:
+        type: { type: string, enum: [PASSPORT, NATIONAL_ID, OTHER] }
+        number:
+          type: string
+          description: Tokenized or reference value; raw document numbers are not stored in the core.
+        issuingCountry: { type: string, pattern: '^[A-Z]{2}$' }
+        expiryDate: { type: string, format: date }
+    Passenger:
+      type: object
+      required: [passengerId, ptc, surname]
+      properties:
+        passengerId: { $ref: '#/components/schemas/Ulid' }
+        ref: { type: string, description: 'Local reference within the order (e.g. P1).' }
+        ptc: { $ref: '#/components/schemas/Ptc' }
+        givenName: { type: string }
+        surname: { type: string }
+        dateOfBirth: { type: string, format: date }
+        document: { $ref: '#/components/schemas/TravelDocument' }
+        loyaltyRef: { type: string, description: 'Reference into the Loyalty module (not owned here).' }
+    Contact:
+      type: object
+      required: [email]
+      properties:
+        contactId: { $ref: '#/components/schemas/Ulid' }
+        email: { type: string, format: email }
+        phone: { type: string }
+        locale: { type: string, example: en-IN }
+        consent:
+          type: boolean
+          description: DPDP consent for transactional contact.
+    ServiceDelivery:
+      type: object
+      required: [deliveryId, state]
+      properties:
+        deliveryId: { $ref: '#/components/schemas/Ulid' }
+        orderItemId: { $ref: '#/components/schemas/Ulid' }
+        state: { type: string, enum: [PENDING, DELIVERED, FAILED] }
+        deliveredAt: { type: string, format: date-time }
+        location: { type: string, description: 'e.g. airport/station code.' }
+    PaymentReference:
+      type: object
+      required: [paymentRefId, paymentIntentId, status]
+      properties:
+        paymentRefId: { $ref: '#/components/schemas/Ulid' }
+        paymentIntentId:
+          type: string
+          description: Reference into the Payments module. No card data is held here.
+        status: { type: string, enum: [PENDING, AUTHORISED, SETTLED, FAILED, REFUNDED] }
+        amount: { $ref: '#/components/schemas/Money' }
+        method: { $ref: '#/components/schemas/PaymentMethod' }
+    OrderItem:
+      type: object
+      required: [orderItemId, type, status]
+      properties:
+        orderItemId: { $ref: '#/components/schemas/Ulid' }
+        type: { $ref: '#/components/schemas/OrderItemType' }
+        status: { $ref: '#/components/schemas/OrderItemStatus' }
+        passengerRef: { type: string, description: 'Local passenger ref this item is for.' }
+        segmentRef: { type: string, description: 'Inventory segment reference (AIR).' }
+        productRef: { type: string, description: 'Product reference (ANCILLARY/SERVICE).' }
+        price: { $ref: '#/components/schemas/Money' }
+        taxes:
+          type: array
+          items: { $ref: '#/components/schemas/TaxComponent' }
+        documentRef:
+          type: string
+          description: e-ticket/EMD number once issued (held via the bridge).
+    Order:
+      type: object
+      required: [orderId, orderRef, status, currency, totalAmount, version]
+      properties:
+        orderId: { $ref: '#/components/schemas/Ulid' }
+        orderRef: { $ref: '#/components/schemas/OrderRef' }
+        status: { $ref: '#/components/schemas/OrderStatus' }
+        currency: { $ref: '#/components/schemas/Currency' }
+        totalAmount: { type: number, example: 5499.00 }
+        amountPaid: { type: number, example: 0 }
+        balanceDue: { type: number, example: 5499.00 }
+        offerRef: { type: string, description: 'The accepted offer (provenance).' }
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/OrderItem' }
+        passengers:
+          type: array
+          items: { $ref: '#/components/schemas/Passenger' }
+        contacts:
+          type: array
+          items: { $ref: '#/components/schemas/Contact' }
+        payments:
+          type: array
+          items: { $ref: '#/components/schemas/PaymentReference' }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        version: { type: integer, description: 'Optimistic-concurrency token; mirrors the ETag.' }
+    OrderList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Order' }
+        nextCursor:
+          type: string
+          nullable: true
+          description: Cursor for the next page, or null when there are no more results.
+    PassengerInput:
+      type: object
+      required: [ref, ptc, surname]
+      properties:
+        ref: { type: string, example: P1 }
+        ptc: { $ref: '#/components/schemas/Ptc' }
+        givenName: { type: string }
+        surname: { type: string }
+        dateOfBirth: { type: string, format: date }
+        document: { $ref: '#/components/schemas/TravelDocument' }
+        loyaltyRef: { type: string }
+    ContactInput:
+      type: object
+      required: [email, consent]
+      properties:
+        email: { type: string, format: email }
+        phone: { type: string }
+        locale: { type: string }
+        consent: { type: boolean, description: 'DPDP consent; must be true to proceed.' }
+    PaymentInput:
+      type: object
+      required: [intentRef, method]
+      properties:
+        intentRef: { type: string, description: 'Payment intent reference from Payments.' }
+        method: { $ref: '#/components/schemas/PaymentMethod' }
+    ItemInput:
+      type: object
+      required: [type]
+      properties:
+        type: { $ref: '#/components/schemas/OrderItemType' }
+        segmentRef: { type: string }
+        productRef: { type: string }
+        passengerRef: { type: string }
+    CreateOrderRequest:
+      type: object
+      required: [offerRef, passengers, contact]
+      properties:
+        offerRef:
+          type: string
+          description: The selected/accepted offer reference.
+        passengers:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/PassengerInput' }
+        contact: { $ref: '#/components/schemas/ContactInput' }
+        payment:
+          $ref: '#/components/schemas/PaymentInput'
+    ChangeOrderRequest:
+      type: object
+      required: [operation]
+      properties:
+        operation:
+          type: string
+          enum: [ADD_ITEM, CANCEL_ITEM, EXCHANGE_ITEM]
+        item:
+          allOf: [{ $ref: '#/components/schemas/ItemInput' }]
+          description: Required for ADD_ITEM and EXCHANGE_ITEM (the new item).
+        orderItemId:
+          allOf: [{ $ref: '#/components/schemas/Ulid' }]
+          description: Required for CANCEL_ITEM and EXCHANGE_ITEM (the target item).
+    CancelOrderRequest:
+      type: object
+      properties:
+        reason:
+          type: string
+          enum: [CUSTOMER_REQUEST, AIRLINE_INITIATED, FRAUD, OTHER]
+        note: { type: string }
+    Problem:
+      type: object
+      description: RFC 9457 problem detail.
+      required: [type, title, status]
+      properties:
+        type: { type: string, format: uri, example: 'https://errors.pss/aurionpro/order/conflict' }
+        title: { type: string, example: Version conflict }
+        status: { type: integer, example: 409 }
+        detail: { type: string, example: The supplied ETag does not match the current order version. }
+        instance: { type: string, format: uri }
+        code: { type: string, description: 'Stable machine-readable error code.', example: ORDER_VERSION_CONFLICT }

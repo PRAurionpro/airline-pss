@@ -1,0 +1,447 @@
+openapi: 3.0.3
+info:
+  title: PSS Channel BFF (IBE Backend-for-Frontend) API
+  version: "0.1.0-draft"
+  description: >
+    Browser-facing Backend-for-Frontend for the Internet Booking Engine (IBE).
+    This contract documents channel-bff exactly as merged.
+
+    Posture (A5 charter): a thin, stateless, MAPPING-ONLY layer with no owned
+    domain, no database, no money math, no saga and no events. It resolves the
+    tenant from the verified bearer token (paved road), assembles/relays requests
+    to Offer, Order, Payments and Inventory over in-cluster HTTP, and returns
+    their responses — three endpoints relay the Offer response VERBATIM as opaque
+    JSON (documented as free-form objects below). Its only non-mapping logic is
+    in-scope seat-geometry validation against static cabin config.
+
+    Conventions & deviations (carried from the platform; see
+    README_BFF_CONTRACTS.md ## Deviations):
+      * Tenant context is derived from the verified bearer token (tenant claim);
+        there is no tenant path/query parameter and no session/cookie.
+      * The BFF opens NO payment window and performs NO money-domain writes; it
+        reads the order's already-open intent. Offer combine/augment are the only
+        writes and are idempotency-keyed by the BFF's own downstream client — the
+        CLIENT-FACING endpoints here take no Idempotency-Key.
+      * Errors use RFC 9457 problem+json (spring.mvc.problemdetails). Two BFF
+        problem codes exist (BFF_BAD_REQUEST, INVALID_SEAT_SELECTION); upstream
+        Offer errors are relayed with their original status + body unchanged.
+      * This is NOT an OpenAPI-generated service — it is hand-written; the JSON
+        passthroughs have no typed BFF schema (see Deviations).
+  contact:
+    name: Aurionpro Solutions Limited — PSS Platform
+    url: https://www.aurionpro.com
+
+servers:
+  - url: https://{host}
+    description: Gateway base URL (region-specific; India regions first)
+    variables:
+      host:
+        default: api.pss.local
+  - url: http://localhost:8080
+    description: Local service port (channel-bff)
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Checkout
+    description: Hosted-checkout session assembly and confirmation-state polling.
+  - name: Shop
+    description: Two-stage shop → combine offer flow (Offer passthrough).
+  - name: Seatmap
+    description: Seat map assembly and ancillary (seat/bag) selection.
+
+paths:
+
+  # ── Checkout ─────────────────────────────────────────────────────────────────────────────
+
+  /checkout/sessions:
+    post:
+      tags: [Checkout]
+      operationId: createCheckoutSession
+      summary: Create a hosted-checkout session for an order
+      description: >
+        Assembles a hosted-checkout session from an existing order and its
+        already-open payment intent. No money math — the order's decimal total is
+        passed through verbatim. If the order has no open payment intent the
+        service raises an unmapped error (500; see Deviations).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CheckoutSessionRequest'
+      responses:
+        '200':
+          description: Checkout session assembled.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CheckoutSession'
+        '400':
+          $ref: '#/components/responses/BffBadRequest'
+        default:
+          $ref: '#/components/responses/UpstreamOrFramework'
+
+  /checkout/sessions/{orderId}/state:
+    get:
+      tags: [Checkout]
+      operationId: getConfirmationState
+      summary: Poll the confirmation/render state for an order
+      description: >
+        Returns the IBE render decision computed from the order's AUTHORITATIVE
+        status (and payment deadline) — never the client's payment callback.
+      parameters:
+        - name: orderId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Current confirmation state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConfirmationState'
+        default:
+          $ref: '#/components/responses/UpstreamOrFramework'
+
+  # ── Shop ─────────────────────────────────────────────────────────────────────────────────
+
+  /bff/shop:
+    get:
+      tags: [Shop]
+      operationId: shop
+      summary: Stage-1 shop (proxy to Offer shop)
+      description: >
+        Maps IBE search parameters to an Offer shop request (ADT-only pax, POS
+        from config) and relays Offer's shop response VERBATIM as opaque JSON.
+      parameters:
+        - { name: origin, in: query, required: true, schema: { type: string } }
+        - { name: destination, in: query, required: true, schema: { type: string } }
+        - name: tripType
+          in: query
+          required: false
+          description: ONE_WAY (default) or RETURN. Invalid value → BFF_BAD_REQUEST (400).
+          schema: { type: string, default: ONE_WAY, enum: [ONE_WAY, RETURN] }
+        - { name: departureDate, in: query, required: true, schema: { type: string, format: date } }
+        - name: returnDate
+          in: query
+          required: false
+          description: Required when tripType=RETURN, else BFF_BAD_REQUEST (400).
+          schema: { type: string, format: date }
+        - name: adults
+          in: query
+          required: false
+          description: 1..9 (default 1); out of range → BFF_BAD_REQUEST (400).
+          schema: { type: integer, default: 1, minimum: 1, maximum: 9 }
+      responses:
+        '200':
+          description: Offer shop response, relayed verbatim.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OfferPassthrough'
+        '400':
+          $ref: '#/components/responses/BffBadRequest'
+        default:
+          $ref: '#/components/responses/UpstreamOrFramework'
+
+  /bff/offers/combine:
+    post:
+      tags: [Shop]
+      operationId: combineOffers
+      summary: Stage-2 combine candidate offers into one orderable offer
+      description: >
+        Forwards 1–2 candidate offer ids to Offer combine (the BFF mints a
+        deterministic `combine-<ids>` Idempotency-Key on the downstream call);
+        relays Offer's response VERBATIM. Client-facing endpoint takes no
+        Idempotency-Key.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CombineRequest'
+      responses:
+        '200':
+          description: Offer combine response, relayed verbatim.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OfferPassthrough'
+        '400':
+          $ref: '#/components/responses/BffBadRequest'
+        default:
+          $ref: '#/components/responses/UpstreamOrFramework'
+
+  # ── Seatmap & ancillaries ────────────────────────────────────────────────────────────────
+
+  /bff/flights/{flightId}/seatmap:
+    get:
+      tags: [Seatmap]
+      operationId: getSeatmap
+      summary: Assemble a seat map for a flight
+      description: >
+        Overlays Inventory seat occupancy onto static cabin geometry (config) and
+        returns a typed, row-major seat grid (BFF-assembled, not a passthrough).
+      parameters:
+        - name: flightId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Assembled seat map.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SeatmapResponse'
+        default:
+          $ref: '#/components/responses/UpstreamOrFramework'
+
+  /bff/offers/{offerId}/ancillaries:
+    post:
+      tags: [Seatmap]
+      operationId: augmentOfferWithAncillaries
+      summary: Validate seat/bag selections and augment the offer
+      description: >
+        Validates seat selections against cabin geometry (the only non-mapping
+        logic) then forwards to Offer AugmentOffer (BFF mints an
+        `augment-<offerId>-<sel>` Idempotency-Key downstream) and relays the
+        augmented offer VERBATIM — its grandTotal is the server-ratified total.
+      parameters:
+        - name: offerId
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AncillariesRequest'
+      responses:
+        '200':
+          description: Augmented Offer response, relayed verbatim.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OfferPassthrough'
+        '422':
+          description: >
+            Seat/bag selection failed BFF geometry validation
+            (INVALID_SEAT_SELECTION): seat not in cabin grid, >1 seat per
+            pax/segment, bag count outside 0..2, or an empty selection set.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        default:
+          $ref: '#/components/responses/UpstreamOrFramework'
+
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >
+        Access token whose verified `tenantId` claim (fallback `tid`) sets the
+        tenant. The BFF is a claims READER (signatures are verified upstream by
+        the gateway/IAM). There is no tenant path/query parameter and no session
+        or cookie. The BFF does not forward this token downstream — each
+        downstream client mints its own minimal tenant token.
+
+  responses:
+    BffBadRequest:
+      description: >
+        BFF request mapping/validation failure (problem code BFF_BAD_REQUEST) —
+        invalid tripType, missing returnDate for RETURN, adults out of range, or
+        wrong candidate-offer count.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    UpstreamOrFramework:
+      description: >
+        Upstream Offer error relayed with its ORIGINAL status + problem+json body
+        unchanged (e.g. 410 OFFER_EXPIRED, 422 CANDIDATES_INCOMPATIBLE), OR a
+        framework default (e.g. 500 for an unmapped IllegalStateException such as
+        a missing payment window or unresolved tenant). The BFF declares no
+        typed shape for these beyond relaying the upstream body.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+  schemas:
+
+    CheckoutSessionRequest:
+      type: object
+      required: [orderId]
+      properties:
+        orderId:
+          type: string
+        customer:
+          $ref: '#/components/schemas/CustomerPrefill'
+
+    CustomerPrefill:
+      type: object
+      description: Optional pre-fill for the hosted checkout form.
+      properties:
+        name: { type: string, nullable: true }
+        email: { type: string, nullable: true }
+        contact: { type: string, nullable: true }
+
+    CheckoutSession:
+      type: object
+      required:
+        - key
+        - paymentIntentId
+        - orderId
+        - amount
+        - currency
+        - name
+        - description
+        - prefill
+        - notes
+      properties:
+        key:
+          type: string
+          description: Provider-neutral public checkout key (config).
+        paymentIntentId:
+          type: string
+          description: The order's existing payment intent id (not opened by the BFF).
+        orderId: { type: string }
+        amount:
+          type: number
+          description: Order total, passed through verbatim (no money math).
+        currency: { type: string }
+        name:
+          type: string
+          description: Merchant display name (config).
+        description: { type: string }
+        prefill:
+          $ref: '#/components/schemas/CustomerPrefill'
+        notes:
+          type: object
+          description: Webhook-correlation notes (orderId, paymentIntentId, pss_intent_id).
+          additionalProperties: { type: string }
+        customerDeadline:
+          type: string
+          format: date-time
+          nullable: true
+          description: Payment intent customer clock deadline, if any.
+
+    ConfirmationState:
+      type: object
+      required: [render, orderId, status]
+      properties:
+        render:
+          $ref: '#/components/schemas/RenderState'
+        orderId: { type: string }
+        status:
+          type: string
+          description: The order's authoritative status.
+        orderRef: { type: string, nullable: true }
+        total: { type: number, nullable: true }
+        currency: { type: string, nullable: true }
+
+    RenderState:
+      type: string
+      enum: [CONFIRMED, CANCELLED, PENDING, FALLBACK]
+      description: >
+        IBE render decision. CONFIRMED→CONFIRMED; CANCELLED/EXPIRED→CANCELLED;
+        AWAITING_PAYMENT/CREATED→FALLBACK if past deadline else PENDING.
+
+    CombineRequest:
+      type: object
+      properties:
+        candidateOfferIds:
+          type: array
+          description: 1 or 2 candidate offer ids; any other count → BFF_BAD_REQUEST.
+          items: { type: string }
+      required: [candidateOfferIds]
+
+    SeatmapResponse:
+      type: object
+      required: [flightInventoryId, cabinCode, rows, columns, grid]
+      properties:
+        flightInventoryId: { type: string }
+        cabinCode: { type: string }
+        rows: { type: integer }
+        columns:
+          type: array
+          items: { type: string }
+        grid:
+          type: array
+          description: Row-major grid of seat cells.
+          items:
+            type: array
+            items:
+              $ref: '#/components/schemas/SeatCell'
+
+    SeatCell:
+      type: object
+      required: [seatNumber, cabinCode, occupied]
+      properties:
+        seatNumber: { type: string }
+        cabinCode: { type: string }
+        occupied: { type: boolean }
+
+    AncillariesRequest:
+      type: object
+      description: Seat and bag selections to add to an offer.
+      properties:
+        seats:
+          type: array
+          items:
+            $ref: '#/components/schemas/SeatPick'
+        bags:
+          type: array
+          items:
+            $ref: '#/components/schemas/BagPick'
+
+    SeatPick:
+      type: object
+      required: [paxRef, segmentRef, seatNumber]
+      properties:
+        paxRef: { type: string }
+        segmentRef: { type: string }
+        seatNumber: { type: string }
+
+    BagPick:
+      type: object
+      required: [paxRef, segmentRef, count]
+      properties:
+        paxRef: { type: string }
+        segmentRef: { type: string }
+        count:
+          type: integer
+          description: 0..2 per pax/segment, else INVALID_SEAT_SELECTION (422).
+
+    OfferPassthrough:
+      type: object
+      description: >
+        Opaque Offer response relayed VERBATIM by the BFF (shop / combine /
+        augmented offer). The BFF declares no typed schema for these — the
+        authoritative shape is Offer's own contract. Free-form by design.
+      additionalProperties: true
+
+    Problem:
+      type: object
+      description: >
+        RFC 9457 problem+json. BFF-authored problems carry an extra `code`
+        property (BFF_BAD_REQUEST | INVALID_SEAT_SELECTION); relayed upstream
+        problems carry whatever the upstream service set.
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        code:
+          type: string
+          description: BFF problem code, when set (BFF_BAD_REQUEST, INVALID_SEAT_SELECTION).

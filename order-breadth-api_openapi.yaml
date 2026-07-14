@@ -1,0 +1,60 @@
+openapi: 3.0.3
+info:
+  title: PSS Tranche-1 Order Breadth Contract Additions (Minimal)
+  version: 0.2.0
+  description: >
+    Minimal contract-first addition for milestone B4 (Order: passenger-mismatch
+    validation, N-item materialization across passengers/segments, ancillary items,
+    money invariant across AIR+ANCILLARY). Pre-empts a FLAG the way
+    offer-breadth-api.openapi.yaml did for B2.
+
+    SCOPE — deliberately minimal (design-seat decision):
+    Adds ONLY the stable machine-readable error-code registry that B4's new
+    validation paths need to signal. It does NOT reshape the Order response
+    (totalAmount, offerRef-as-string, etc. are unchanged) — B4 validates and
+    materialises against the offer it READS; any consumer-side mapping to the new
+    offer wire (grandTotal/stage/per-(pax×segment) items) is handled as parse/mapping
+    compat exactly as ratified for B2, not as an Order contract change.
+
+    MERGE: the OrderErrorCode enum below is the stable code set for order-api's
+    Problem.code field (which is currently free-text with no enum). On merge into
+    order-api.openapi.yaml, constrain Problem.code to this enum. Until then this
+    file is authoritative for B4's error codes.
+
+    These map to existing HTTP responses already in order-api.openapi.yaml
+    (422 Unprocessable, 409 Conflict, etc.) — no new paths, no new response codes.
+components:
+  schemas:
+    OrderErrorCode:
+      type: string
+      description: >
+        Stable machine-readable error codes for the Order module. Returned in
+        Problem.code (RFC 9457). HTTP status shown for each is the existing
+        order-api response it rides on.
+      enum:
+        # --- B4 breadth validation (the gap this delta fills) ---
+        - PASSENGERS_MISMATCH_OFFER      # 422: CreateOrder passengers don't match the offer's pax set (count/ptc/refs)
+        - OFFER_NOT_ORDERABLE            # 422: offer stage != JOURNEY (candidate offer presented to CreateOrder)
+        - ANCILLARY_REF_MISMATCH         # 422: an ANCILLARY item's paxRef/segmentRef not present in the order's pax/itinerary
+        - MONEY_INVARIANT_VIOLATED       # 422: Σ item amounts != offer grandTotal at assembly (abort creation)
+        - OFFER_EXPIRED                  # 422: the referenced offer is past validUntil at CreateOrder
+        # --- already-in-use Order conditions, given stable codes for completeness ---
+        - ORDER_VERSION_CONFLICT         # 409: stale ETag / If-Match
+        - ORDER_NOT_FOUND                # 404
+        - VALIDATION_FAILED              # 400
+        - UNAUTHORIZED                   # 401
+        - FORBIDDEN                      # 403
+        - DOWNSTREAM_UNAVAILABLE         # 503: Offer/Inventory/Pricing unreachable during create
+    ProblemWithCode:
+      type: object
+      description: >
+        RFC 9457 problem detail with the code field constrained to OrderErrorCode.
+        Shape-identical to order-api's existing Problem; only `code` is enumerated.
+      required: [type, title, status, code]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string, format: uri }
+        code: { $ref: '#/components/schemas/OrderErrorCode' }

@@ -1,0 +1,569 @@
+PSS — System Design Document	Working Draft v0.1
+
+**PASSENGER SERVICE SYSTEM (PSS)**
+
+**System Design Document**
+
+*Modular, Multi-Tenant, Order-Native Retailing Platform (SaaS)*
+
+Version 0.1 — Working Draft
+
+Prepared: June 2026
+
+Companion to: PSS — Landscape, Design & Roadmap (v0.1)
+
+**Prepared by Aurionpro Solutions Limited**
+
+**Table of Contents**
+
+# 1. Introduction and Purpose
+
+## 1.1 Purpose and scope
+
+This System Design Document (SDD) defines the target architecture for an in-house Passenger Service System (PSS) and retailing platform. Where the companion discovery document established the market context, the functional component set and a phased roadmap, this document specifies how the system is built: its design principles, logical architecture, module decomposition, the shared platform framework, the multi-tenancy and SaaS operating model, the data and integration strategy, the non-functional targets, and the governance and delivery approach.
+
+It is an architecture specification, not a detailed low-level design. It defines the shape, boundaries, contracts and operating model that subsequent module-level designs must conform to. Indicative technology choices are recorded to frame trade-offs; they are decisions for the architecture board to ratify.
+
+## 1.2 Relationship to the discovery document
+
+The discovery document (v0.1) remains the source for the market landscape, the functional capability catalogue (all thirteen requested components, the OOSD framework and the legacy-to-Offer-&-Order transition), the capability-to-priority map and the delivery phases. This SDD assumes that material and does not repeat it; it builds the engineering view on top. Two decisions taken since v0.1 shape this document: the platform is built fully in-house, and it is delivered as a modular, multi-tenant SaaS sold to multiple carriers.
+
+## 1.3 Design mandate
+
+The design is driven by an explicit mandate. Every principle and pattern in this document traces back to one of these goals:
+
+| **Goal** | **What it means concretely** | **Primary design response** |
+| --- | --- | --- |
+| **Stable ****&**** sound** | No single points of failure; predictable behaviour under load and failure; correctness of money and seats. | HA topology, strong consistency where it matters, idempotency, graceful degradation, rehearsed DR (§11, §12). |
+| **Strong framework** | A shared foundation so every module is built, run and changed the same way. | The platform 'paved road' — service template, shared services, standard patterns (§6). |
+| **Minimum effort to operate ****&**** maintain** | Low operational toil; changes are cheap and safe; few bespoke parts. | Automation-first ops, observability & SLOs, progressive delivery, config-over-code, no per-tenant forks (§6, §12). |
+| **Sold to multiple customers** | Many carriers on one platform, each isolated and individually configurable. | Multi-tenancy by design; tenant isolation, configuration, metering & lifecycle (§7). |
+| **Modular** | Independently deployable and independently sellable capabilities. | Domain-driven bounded contexts, API-first contracts, event-driven coupling (§2, §4, §5). |
+| **Service model** | Operated as a managed service with SLAs, not shipped software. | SaaS operating model: environments, release, SRE, support tiers, FinOps (§12). |
+
+## 1.4 Status and how to read this document
+
+Sections 2–5 establish principles, the competitor-informed rationale, the logical architecture and the module decomposition. Sections 6–7 cover the two pillars that most directly serve the mandate — the platform framework and multi-tenancy. Sections 8–13 detail data, integration, security, the non-functional targets, the SaaS operating model and the indicative stack. Sections 14–17 cover governance, delivery, risks and the decisions still open. Open items are flagged in Section 17 rather than guessed at.
+
+# 2. Design Principles and Quality Attributes
+
+The following principles are binding. They are deliberately few, so they can actually be enforced through review and automated fitness functions (§14).
+
+- **Order-native and standards-aligned. **The Order is the primary record from day one, aligned to IATA NDC, ONE Order and the Reference Business Architecture (RP 1786a). PNR/e-ticket/EMD compatibility exists only as an explicit bridge, never as the core model.
+
+- **Modular by bounded context. **Each capability is a service owning its data and contract. Modules are independently deployable and independently sellable; no module reaches into another's database.
+
+- **API-first, contract-first. **Every interaction is a versioned, documented API or a published event. Contracts are designed and agreed before implementation and verified by contract tests.
+
+- **Event-driven core. **State changes are emitted as events on a durable backbone, enabling loose coupling, audit, replay and real-time analytics. Strong consistency is reserved for money and seats; elsewhere the system is eventually consistent by design.
+
+- **Multi-tenant by design. **Tenancy is a first-class concept threaded through identity, data, configuration, observability and billing — not retrofitted. One codebase serves all tenants.
+
+- **Configuration over customization. **Carrier differences are expressed as configuration and feature flags, never as per-tenant code forks. This is the single most important rule for keeping maintenance effort low at scale.
+
+- **Cloud-native and automated. **Containerised, horizontally scalable, infrastructure-as-code, immutable deployments, multi-AZ by default. Everything repeatable is automated.
+
+- **Designed for operability. **Observability, health, self-healing and safe rollout are built into every service from the first commit, not added later.
+
+- **Secure and compliant by default. **Zero-trust, least privilege, encryption everywhere, PCI scope isolation and data-protection controls are part of the paved road, not opt-in extras.
+
+- **Coexistence with legacy. **The platform will run alongside incumbent systems for years; bridging and synchronisation are core features, so adoption never requires a big-bang cutover.
+
+## 2.1 Quality attributes and the tactics that deliver them
+
+The architecture is judged against measurable quality attributes. Each is met by specific tactics, referenced where they are detailed:
+
+| **Quality attribute** | **Architectural tactics** |
+| --- | --- |
+| **Availability** | Statelessness, redundancy across AZs, health checks, circuit breakers, bulkheads, graceful degradation of non-critical paths, rehearsed failover (§11, §12). |
+| **Performance** | Read models / caching for shopping, async for non-blocking work, latency budgets per call, back-pressure, autoscaling on demand signals (§8, §11). |
+| **Scalability** | Horizontal scale, partitioning by tenant and by flight/date, stateless services, elastic event consumers (§7, §8). |
+| **Data integrity** | Strong consistency for inventory/order/payment, idempotent commands, transactional outbox, sagas with compensation, exactly-once effects (§8). |
+| **Modifiability** | Bounded contexts, versioned contracts, the service template and shared libraries, feature flags (§5, §6). |
+| **Operability** | Standard telemetry, SLOs and error budgets, runbooks, GitOps, progressive delivery, automated remediation (§12). |
+| **Security** | Zero-trust, mTLS, RBAC/ABAC, tokenization, secrets management, supply-chain controls (§10). |
+| **Tenant isolation** | Tenant context propagation, data partitioning, quota/rate isolation, per-tenant keys (§7). |
+| **Interoperability** | NDC/ONE Order conformance, standards behind adapters, legacy bridges, partner sandbox (§9). |
+
+# 3. Competitor Solutions — Architecture Review and Implications
+
+The serious platforms have converged on the same architectural shape, which validates the direction of this design and sharpens where differentiation must come from. The review below reads competitors through an architecture lens rather than a feature lens.
+
+| **Platform** | **Architecture posture** | **What we take from it** |
+| --- | --- | --- |
+| Amadeus Nevio | Modular, cloud-native, AI-enabled, explicitly PSS-independent, with 'smart bridging' from any existing PSS; aimed at full-service and hybrid carriers. | Coexistence/bridging as a first-class feature; modularity that does not require ripping out the incumbent. |
+| Sabre SabreMosaic | Open, modular, cloud-native; ~10 product suites (offers, orders, settlement, delivery) each composed of microservices; built on Google Cloud; supports a hybrid PNR-and-Order state via a 'PSS Sync' bridge; AI retail-intelligence (pricing, ancillary, upgrade). | Suite-of-modules packaging with microservices inside each; pick-what-you-need composition; an explicit order-to-PNR sync bridge. |
+| Accelya FLX ONE | API-driven, cloud-native (AWS) OOSD platform evolved from a high-volume retailing engine; emphasises transition at the airline's own pace and retained ownership of strategy. | API-first OOSD at very high offer/settlement volume; staged adoption messaging. |
+| Hitit Oxygen | Native Offer & Order retailing platform, already in production at a carrier — a challenger shipping real OOSD, not just a roadmap. | Proof that a focused team can ship native O&O; modular challengers can win on agility and footprint. |
+| FLYR-led composition (Riyadh Air) | A greenfield carrier assembled from best-of-breed modules on the RP 1786a framework — FLYR with Sabre offer optimisation, a third party for order accounting and another for order delivery. | The strongest proof point: a standards-based, modular, multi-vendor assembly runs a real airline. Our single-vendor modular suite is a cleaner version of the same idea. |
+
+## 3.1 Distilled lessons
+
+- **Adopt: **modular, API-first, cloud-native, order-native on RP 1786a; an explicit legacy bridge; AI applied to pricing/offers; pick-what-you-need module packaging.
+
+- **Avoid: **the incumbents' multi-generation hybrid estates (mainframe + SOA + microservices at once) that are the root of their cost and rigidity; big-bang cutovers; bespoke per-customer codebases.
+
+- **Where execution risk bites rivals: **large O&O transitions are slow and high-risk and several flagship platforms are still early in rollout. A platform engineered for low-risk, incremental adoption and low operating cost is a credible wedge.
+
+## 3.2 Our differentiation thesis
+
+We do not need to out-feature Amadeus or Sabre on day one. The opportunity is a clean, single-vendor, standards-native modular suite that is (a) genuinely multi-tenant SaaS — so a carrier onboards by configuration, not a multi-year project — and (b) engineered for low total cost of ownership through a strong shared framework. In short: the modularity and standards of the challengers, delivered with the operational discipline of a mature SaaS, without the legacy baggage of the incumbents.
+
+# 4. Logical Architecture
+
+The platform is organised into horizontal layers. Higher layers depend on lower ones through published contracts; no layer reaches around another. The retailing and order layers carry the commercial differentiation; the core-services layer is the transactional system of record; the platform layer is the shared paved road every module stands on.
+
+*Figure 1 — Logical reference architecture. Modules are illustrative of each layer, not exhaustive.*
+
+## 4.1 The layers
+
+- **Experience ****&**** Channels — **all customer and agent touchpoints (web IBE, mobile, kiosk/bag-drop, agent/call-centre, WhatsApp & chat, partner portals). They render experiences only; they hold no business logic and consume the same offer/order APIs.
+
+- **Channel ****&**** Distribution — **the edge: API gateway, NDC endpoints, GDS/EDIFACT adapters, OTA/TMC connectors, the B2B/Corporate/SME surfaces and a backend-for-frontend per channel. This layer normalises every channel onto one core.
+
+- **Retailing (Offer) — **offer management, pricing & fares, ancillaries/merchandising, revenue management, personalisation/CDP and loyalty (FFP). This is where commercial value is created.
+
+- **Order ****&**** Fulfilment — **order management and servicing, the ticketing/EMD bridge, delivery/DCS, baggage, weight & balance and IROPS. The order lifecycle lives here.
+
+- **Core Services — **inventory/availability, schedule & flight, fleet & cabin configuration, payments & settlement, order accounting and fares/reference data: the transactional system of record.
+
+- **Data ****&**** Intelligence — **the event/streaming backbone, data lake/warehouse, ML feature and model services, and the reporting & BI module.
+
+- **Platform (cross-cutting) — **identity & access, configuration/feature flags, secrets, observability, audit, CI/CD, notification and workflow/saga orchestration. Detailed in §6.
+
+Cargo is an adjacent, separately-built Cargo Management System integrated through a defined contract (shared flight/fleet master data, capacity feeding weight-and-balance, common identity/payments/reporting), per the decision recorded in v0.1.
+
+## 4.2 How a sale flows (OOSD)
+
+The commercial path follows the Offer–Order–Settle–Deliver lifecycle. A shopping request is resolved against availability and priced into an offer; the customer's selection becomes a single order; payment is orchestrated; the order is fulfilled operationally; and money is reconciled into order accounting. Every transition emits an event, so analytics, audit and downstream modules react without tight coupling.
+
+*Figure 2 — OOSD order lifecycle over the event backbone.*
+
+# 5. Domain Decomposition and Module Catalog
+
+Modules are bounded contexts aligned to the IATA Reference Business Architecture (RP 1786a) and the OOSD domains. Each owns its data and its contract. The catalogue below is the authoritative module list; the phase column ties each module to the delivery roadmap from v0.1.
+
+## 5.1 Module catalogue
+
+| **Module** | **Domain** | **Responsibility (summary)** | **Phase** |
+| --- | --- | --- | --- |
+| Fleet & Cabin Configuration | Plan/Core | Aircraft types, cabin layouts, seat maps, equipment; version-controlled master data. | P0–P1 |
+| Schedule & Flight | Plan/Core | Flights, schedules, equipment assignment, codeshare/operating data. | P1 |
+| Inventory / Availability | Offer/Core | Sellable counts per flight/cabin/RBD and dynamic availability; holds; overbooking. | P1 |
+| Pricing & Fares | Offer | Fare construction, rules, taxes; filed then dynamic/continuous pricing. | P1→P4 |
+| Offer Management | Offer | Construct, price and personalise air + ancillary + 3rd-party offers across channels. | P1→P2 |
+| Order Management | Order | The single order record; lifecycle, servicing, changes, cancellations, fulfilment. | P1 |
+| Ticketing / EMD Bridge | Order | e-ticket/EMD issuance during transition; evolves to order-based fulfilment. | P1 |
+| Payments & Settlement | Settle | Payment orchestration, tokenization, fraud, refunds; BSP/ARC feed. | P1→P3 |
+| Order Accounting | Settle | Customer & supplier order accounting, revenue recognition, reconciliation. | P3 |
+| Ancillaries & Merchandising | Offer | Seats, bags, lounge, Wi-Fi, upgrades, insurance, partner products. | P2 |
+| Revenue Management | Offer | Forecasting & optimisation feeding offer pricing. | P2 |
+| Loyalty (FFP) | Offer/Order | Members, tiers, miles earn/burn, awards; built in-house. | P2 |
+| Personalisation / CDP | Offer | 360° customer view feeding offer relevance, with consent. | P2→P4 |
+| Distribution / NDC | Offer/Order | NDC endpoints to OTA/TMC/aggregators; GDS adapters; interline (SRSIA). | P2 |
+| B2B / Corporate / SME | Offer | Agency portal, corporate/SME booking, policy, markups, billing. | P2 |
+| Conversational Commerce | Offer/Deliver | WhatsApp/chat feature for booking, servicing, check-in, notifications. | P2 |
+| Delivery / DCS | Deliver | Check-in, seating, boarding, regulatory capture, boarding documents; biometric-ready. | P3 |
+| Baggage | Deliver | Acceptance, tracking, reconciliation; airport-systems integration. | P3 |
+| Weight & Balance | Deliver | Load planning and safety-critical balance; built with certification rigour. | P3 |
+| IROPS / Disruption | Deliver | Rebooking, re-accommodation, notifications, compensation. | P3 |
+| Reporting & BI | Cross-cutting | Operational, commercial, financial, regulatory reporting & dashboards. | P2 |
+| Analytics & Data Backbone | Cross-cutting | Event backbone, lake/warehouse, ML feature/model services. | P0–P2 |
+| Cargo CMS (adjacent) | Adjacent | Separately-built cargo system; integrated via defined contract. | P3 |
+
+## 5.2 Core module specifications
+
+The foundational modules are specified below to a common template (responsibility, key entities, primary APIs, key domain events published/consumed, data ownership, consistency model, dependencies). The remaining modules are specified to the same template in their module-level designs; the catalogue above fixes their scope and sequencing.
+
+**Order Management**
+
+| **Aspect** | **Specification** |
+| --- | --- |
+| Responsibility | Own the Order as the single system of record for what a customer bought; manage its full lifecycle — creation, change (add/cancel/exchange item), servicing, cancellation, fulfilment — and maintain PNR/e-ticket/EMD compatibility via the bridge during transition. |
+| Key entities | Order, OrderItem (air segment / ancillary / 3rd-party service), Passenger, ServiceDelivery, PaymentReference, OrderStatus. |
+| **Primary APIs** | CreateOrder · GetOrder · ChangeOrder · CancelOrder · ListOrders *ONE Order-conformant order messages.* |
+| Publishes | OrderCreated, OrderItemAdded, OrderChanged, OrderCancelled, OrderFulfilled. |
+| Consumes | OfferAccepted, PaymentSettled, DeliveryConfirmed, InventoryConfirmed/Released. |
+| Data ownership | Order store — strongly consistent, fully audited. |
+| Consistency | Strong/transactional for order state and financial linkage; all commands idempotent. |
+| Depends on | Inventory (confirm holds), Payments, Pricing (repricing on change), Offer (accept), Delivery. |
+
+**Offer Management**
+
+| **Aspect** | **Specification** |
+| --- | --- |
+| Responsibility | Construct, price and personalise offers (air + ancillaries + third-party content) for a given shopping context and channel; support bundling/unbundling; produce NDC offer responses. Offers are ephemeral and re-validated at order time. |
+| Key entities | Offer, OfferItem, ShoppingContext, PriceComponent, Eligibility. |
+| **Primary APIs** | AirShopping · OfferPrice · GetOffer · SelectOffer *NDC OfferRequest / OfferResponse.* |
+| Publishes | OfferCreated, OfferSelected, OfferExpired. |
+| Consumes | AvailabilityChanged, FareUpdated, CustomerContext, RevenueManagement signals. |
+| Data ownership | Offer store — document, short TTL, read-optimised. |
+| Consistency | Eventual; correctness is re-asserted at order creation against inventory and price. |
+| Depends on | Inventory/Availability, Pricing & Fares, Revenue Management, Personalisation/CDP, Ancillaries. |
+
+**Inventory / Availability**
+
+| **Aspect** | **Specification** |
+| --- | --- |
+| Responsibility | Maintain sellable counts per flight, cabin and RBD (and dynamic availability in the target model); apply overbooking and segment-level controls; serve real-time availability at high look-to-book ratios; manage time-boxed holds. |
+| Key entities | FlightInventory, Bucket/RBD, AvailabilityView, SeatHold. |
+| **Primary APIs** | GetAvailability · HoldInventory · ConfirmHold · ReleaseHold · AdjustInventory |
+| Publishes | AvailabilityChanged, InventoryHeld, InventoryReleased, InventoryConfirmed. |
+| Consumes | ScheduleChanged, OrderCreated/Cancelled, RevenueManagement controls. |
+| Data ownership | Inventory store — strongly consistent, high-throughput; separate availability read cache. |
+| Consistency | Strong for counts and holds (no oversell beyond policy); holds are idempotent with TTL. |
+| Depends on | Schedule & Flight, Fleet & Cabin Configuration, Revenue Management. |
+
+**Pricing ****&**** Fares**
+
+| **Aspect** | **Specification** |
+| --- | --- |
+| Responsibility | Construct prices: fare selection, rule and tax/surcharge application; filed fares first, dynamic/continuous pricing later; deterministic repricing on order change. |
+| Key entities | Fare, FareRule, TaxRule, PriceQuote. |
+| **Primary APIs** | PriceItinerary · Reprice · QuoteTaxes · GetFareRules |
+| Publishes | FareUpdated, FareFiled. |
+| Consumes | ScheduleChanged, FX rates, dynamic-pricing / RM signals. |
+| Data ownership | Fares & pricing-rules store (read-mostly); deterministic quote service. |
+| Consistency | A quote is strongly consistent and versioned; the fares reference is read-mostly. |
+| Depends on | Revenue Management / dynamic pricing (later phases), FX, tax reference data. |
+
+**Payments ****&**** Settlement**
+
+| **Aspect** | **Specification** |
+| --- | --- |
+| Responsibility | Orchestrate payment across methods and currencies; tokenize instruments; run fraud checks; process refunds; feed BSP/ARC and order accounting; support settlement-with-orders. Card data is isolated from the core (PCI scope). |
+| Key entities | PaymentIntent, Transaction, Refund, SettlementRecord. |
+| **Primary APIs** | InitiatePayment · CapturePayment · Refund · GetPaymentStatus |
+| Publishes | PaymentAuthorised, PaymentSettled, PaymentFailed, RefundIssued. |
+| Consumes | OrderCreated, OrderChanged. |
+| Data ownership | Payment store in an isolated PCI scope; instruments held as tokens in a vault — no PAN in the core. |
+| Consistency | Strong financial consistency; idempotent operations; continuous reconciliation. |
+| Depends on | Payment service providers, fraud service, Order, Order Accounting. |
+
+**Delivery / Departure Control (DCS)**
+
+| **Aspect** | **Specification** |
+| --- | --- |
+| Responsibility | Airport-facing fulfilment: validate the order, check-in, assign seats, capture regulatory/government data, issue boarding documents (biometric-ready), accept baggage and board passengers; trigger revenue recognition at consumption. |
+| Key entities | CheckIn, SeatAssignment, BoardingPass, RegulatoryDocument, FlightDeparture. |
+| **Primary APIs** | CheckIn · AssignSeat · IssueBoardingPass · AcceptBag · BoardPassenger · CloseFlight |
+| Publishes | PassengerCheckedIn, BoardingPassIssued, BagAccepted, PassengerBoarded, FlightClosed. |
+| Consumes | Order data, Inventory (seat), Weight & Balance, government-data responses. |
+| Data ownership | Departure store, per-flight. |
+| Consistency | Strong for seat and boarding state; safety- and operations-critical; highest availability tier. |
+| Depends on | Order, Inventory, Baggage, Weight & Balance, government data, biometric services. |
+
+**Distribution / NDC**
+
+| **Aspect** | **Specification** |
+| --- | --- |
+| Responsibility | Expose NDC-conformant Offer/Order APIs to OTAs, TMCs and aggregators; provide GDS/EDIFACT adapters for the transition; onboard sellers with a sandbox; support order-based interline under SRSIA. |
+| Key entities | SellerProfile, DistributionMessage, InterlineAgreement. |
+| **Primary APIs** | AirShopping · OfferPrice · OrderCreate · OrderChange · OrderRetrieve *plus EDIFACT/Type-B adapters.* |
+| Publishes | DistributionOrderCreated. |
+| Consumes | Offer, Order. |
+| Data ownership | Seller/configuration store; message log for audit and replay. |
+| Consistency | Eventual at the edge; correctness enforced by Order and Inventory underneath. |
+| Depends on | Offer, Order, Inventory, Identity & Access. |
+
+# 6. The Platform Framework (the Paved Road)
+
+The framework is the answer to two goals at once: a strong foundation, and minimum effort to build, operate and maintain. Instead of each module solving identity, configuration, telemetry, messaging and deployment its own way, the platform provides these once, as a 'paved road' that every module is built on. A team building a new module inherits security, observability, multi-tenancy and deployment for free and writes only its business logic.
+
+## 6.1 Shared platform services
+
+Provided centrally and consumed by every module:
+
+| **Service** | **What it provides** |
+| --- | --- |
+| **Identity ****&**** Access** | Authentication (customers, agents, staff, partners, services), RBAC/ABAC, OAuth2/OIDC, service-to-service identity (mTLS). |
+| **Tenant Registry** | The catalogue of tenants, their tier, configuration set, entitlements and residency; the source of tenant context. |
+| **Configuration ****&**** Feature Flags** | Hierarchical configuration (global → tenant → environment) and runtime flags enabling config-over-code and safe progressive rollout. |
+| **Secrets ****&**** Key Management** | Centralised secrets, rotation and per-tenant encryption keys. |
+| **API Gateway** | Edge routing, authN/Z, rate limiting and quotas (per tenant/seller), schema validation, versioning. |
+| **Event Backbone** | Durable event log for domain events: publish/subscribe, replay, ordering guarantees where needed. |
+| **Workflow / Saga Orchestration** | Long-running, multi-service processes (e.g. book-pay-fulfil) with compensation. |
+| **Notification** | Outbound communications across email, SMS, push and WhatsApp, templated and tenant-branded. |
+| **Audit ****&**** Compliance Log** | Tamper-evident record of who did what to which order/tenant, for regulatory and forensic needs. |
+| **Observability** | Standard tracing, metrics and structured logging wired in by the service template (§12). |
+| **CI/CD ****&**** Delivery** | Pipelines, artefact signing, environment promotion and GitOps deployment. |
+
+## 6.2 The golden-path service template
+
+A new module is created from a service template (a scaffold) that comes pre-wired with everything the paved road expects: health and readiness endpoints, telemetry, structured logging and trace propagation, tenant-context handling, configuration and secrets clients, the event-publishing library with a transactional outbox, idempotency and retry helpers, an API skeleton with contract-test scaffolding, a container build, and a deployment manifest. The effect is that consistency is the default and divergence requires effort — the opposite of the usual drift that drives maintenance cost up.
+
+## 6.3 Standard patterns (solved once, reused everywhere)
+
+- **Idempotency. **Every state-changing command carries an idempotency key so retries are safe — essential for money and seats.
+
+- **Transactional outbox. **Services persist state and the resulting event in one transaction, then publish reliably — no lost or phantom events.
+
+- **Sagas with compensation. **Cross-module processes (book → hold inventory → take payment → confirm order) coordinate via the orchestrator with explicit compensating actions on failure.
+
+- **CQRS / read models. **High-read paths (shopping, availability) are served by purpose-built read models updated from events, isolating read load from the write side.
+
+- **Circuit breakers ****&**** bulkheads. **A failing dependency is isolated so it cannot cascade; non-critical features degrade gracefully while critical paths stay up.
+
+- **Contract testing. **Consumer-driven contract tests gate every release so a provider cannot break a consumer unnoticed.
+
+These patterns live in shared libraries on the paved road. Because they are implemented once and inherited, every module gets correct, battle-tested behaviour for the hard distributed-systems problems — which is precisely what keeps the system stable and cheap to maintain at scale.
+
+# 7. Multi-Tenancy Design
+
+The platform serves many carriers from one codebase and one control plane. Tenancy is threaded through identity, data, configuration, observability and billing. The guiding rule (§2) is config-over-code: carriers differ only by configuration, never by forked code.
+
+*Figure 3 — Multi-tenant model: shared control plane, configurable data plane, isolation tiered by need.*
+
+## 7.1 Isolation model
+
+A single isolation model does not fit every carrier, so the platform supports a tiered model chosen per tenant at onboarding, all running the same application code:
+
+| **Tier** | **Isolation** | **Best for** |
+| --- | --- | --- |
+| **Pooled** | Shared services and shared datastores with strict row-level tenant isolation and per-tenant encryption keys. | Most LCC, regional and SME carriers — lowest cost, fastest onboarding. |
+| **Bridged** | Shared compute, dedicated datastore per tenant. | Mid/large carriers needing data separation without a dedicated stack. |
+| **Siloed** | Dedicated stack (compute + data), often in a specific region. | Flag carriers with data-residency, scale or regulatory demands. |
+
+## 7.2 Tenant context and data isolation
+
+Every request carries a verified tenant identity from the gateway inward; tenant context propagates through calls, events and logs. Data access is tenant-scoped by default — a query without tenant context is rejected. Encryption keys are per tenant, so even pooled data is cryptographically separated. Event streams are partitioned by tenant, and the observability stack tags all telemetry with tenant so dashboards, alerts and cost can be sliced per carrier.
+
+## 7.3 Configuration, not customization
+
+Carrier-specific behaviour is expressed only through configuration and feature flags: branding and white-labelling, fare and ancillary catalogues, business rules and policies, enabled modules and channels, payment methods, currencies and languages, and data-residency. New carrier needs are met by extending the configuration model, not by branching code. This is the central mechanism that keeps per-tenant maintenance near zero as the customer base grows.
+
+## 7.4 Tenant lifecycle and commercial operations
+
+- **Onboarding/provisioning. **Automated tenant creation: registry entry, isolation tier, keys, default configuration, environments — a configuration exercise measured in days, not a project measured in years.
+
+- **Metering ****&**** billing. **Usage (bookings, messages, API calls, storage) is metered per tenant to support the chosen commercial model — subscription, transaction-based or hybrid.
+
+- **Noisy-neighbour control. **Per-tenant quotas and rate limits, plus workload isolation, prevent one carrier degrading another.
+
+- **Offboarding. **Clean, auditable export and deletion of a tenant's data on exit, honouring retention and contractual obligations.
+
+# 8. Data Architecture
+
+Data ownership follows module boundaries: each service owns its store and exposes data only through its API or its events. There is no shared database and no cross-module table access — this is what allows modules to evolve and scale independently.
+
+- **Polyglot persistence. **A strongly-consistent transactional store for orders, inventory and payments; document stores for offers; a warehouse and lake for analytics; caches/read models for high-read paths.
+
+- **Consistency by domain. **Strong consistency where money and seats are concerned; eventual consistency, propagated by events, everywhere else — a deliberate trade for scalability and availability.
+
+- **Event backbone ****&**** outbox. **Domain events are the integration fabric and the audit trail; the transactional outbox guarantees state and event are published atomically.
+
+- **Master ****&**** reference data. **Fleet/cabin, schedule and fares are managed as governed master data with versioning and controlled propagation to dependents.
+
+- **Analytics pipeline. **Events stream into the lake/warehouse feeding the Reporting & BI module and ML feature/model services, without loading the transactional path.
+
+- **Tenant partitioning ****&**** PII. **Data is partitioned by tenant; PII is classified, encrypted at rest and in transit, minimised, and governed by retention and residency rules (§7, §10).
+
+# 9. Integration and Standards Conformance
+
+## 9.1 IATA standards
+
+Standards are first-class and abstracted behind adapters so schema evolution does not ripple through the core:
+
+| **Standard** | **Role in the platform** |
+| --- | --- |
+| NDC (Res 787 + schemas) | Offer/Order distribution data standard for shop-order-pay-service across channels. |
+| ONE Order (Res 797) | The single order record consolidating PNR/e-ticket/EMD; the model the Order module implements. |
+| Reference Business Architecture (RP 1786a) | The capability framework the module decomposition aligns to. |
+| Settlement with Orders (Res 750a) | Order-based settlement feeding order accounting. |
+| Product Management (RP 1730) | Standardised product/ancillary information. |
+| Interline (SRSIA, RP 1780s) | Order-based retailer–supplier interline agreements. |
+| Digital identity / biometric, admissibility (RP 1701p) | Contactless delivery and digitised travel-document checks in DCS. |
+
+## 9.2 Legacy and external integration
+
+- **Legacy bridges. **PNR/e-ticket/EMD adapters and EDIFACT/Type-B connectors let the platform coexist with incumbent PSS and GDS during transition — the order-to-PNR synchronisation pattern the incumbents themselves ship.
+
+- **Payments. **Payment service providers and fraud services behind the Payments module's PCI-isolated boundary.
+
+- **Airport ****&**** operations. **Baggage reconciliation, departure/airport systems, and government data (API/PNR/PNRGOV) through defined contracts.
+
+- **Cargo. **The adjacent Cargo CMS via the shared-master-data and capacity contract (§4).
+
+- **Conversational. **WhatsApp Business API and chat, reusing the same offer/order APIs through the Conversational Commerce feature.
+
+## 9.3 API management
+
+APIs are versioned with a published lifecycle and deprecation policy, documented (OpenAPI / NDC schemas), exposed through the gateway with per-consumer rate limits and quotas, and backed by a partner sandbox for seller onboarding. Backward compatibility is a release gate (§12).
+
+# 10. Security, Privacy and Compliance
+
+- **Zero-trust. **No implicit trust between services; mutual TLS and service identity; least-privilege access throughout.
+
+- **Identity ****&**** authorization. **Central authN/Z with RBAC/ABAC for customers, agents, staff, partners and services.
+
+- **Encryption ****&**** secrets. **Encryption in transit and at rest; centralised secrets with rotation; per-tenant keys.
+
+- **Payments. **PCI DSS scope isolation, tokenization, no PAN in the core — the Payments boundary contains cardholder data.
+
+- **Privacy ****&**** data protection. **GDPR and regional regimes; consent management; data minimisation; residency per tenant; subject-access and deletion support.
+
+- **Audit. **Tamper-evident, tenant-scoped audit of sensitive actions across orders and configuration.
+
+- **Secure SDLC ****&**** supply chain. **Security in the pipeline (SAST/DAST, dependency and container scanning), signed artefacts, and SBOMs.
+
+# 11. Non-Functional Requirements (Targets)
+
+Targets are expressed as service-level objectives with explicit numbers to be ratified, then enforced as SLOs with error budgets (§12). Availability is tiered: the paths whose failure grounds flights carry the highest target.
+
+| **Dimension** | **Indicative target (to ratify)** |
+| --- | --- |
+| **Availability — critical paths** | Booking, payment, check-in/DCS: ≥ 99.95% with graceful degradation; no single point of failure; tested failover. |
+| **Availability — supporting paths** | Reporting, batch, non-critical servicing: ≥ 99.9%. |
+| **Shopping latency** | Availability/offer responses sub-second (p95) at high look-to-book ratios. |
+| **Order/payment latency** | Order create and payment authorise within a low single-digit-second p95 budget. |
+| **Throughput ****&**** scale** | Elastic to seasonal and IROPS surges; horizontal scale with no architectural ceiling within a region. |
+| **Data integrity** | Exactly-once financial and seat effects; idempotent commands; no oversell beyond policy. |
+| **Recoverability** | Defined RPO/RTO per data class; backups; DR runbooks rehearsed, not merely documented. |
+| **Security ****&**** compliance** | PCI DSS for payments; GDPR/regional data protection; encryption everywhere. |
+| **Observability** | End-to-end tracing, business + technical metrics, per-tenant slicing, replayable event history. |
+
+# 12. Operability and the SaaS Service Model
+
+The platform is run as a managed service against SLAs, not shipped as software. The operating model is engineered so that running many carriers costs little incremental effort — the core of the 'minimum effort to operate and maintain' goal.
+
+## 12.1 Environments and delivery
+
+- **Environments. **Development, test, staging and production, provisioned identically through infrastructure-as-code; promotion is automated and gated.
+
+- **CI/CD ****&**** GitOps. **Every change flows through automated build, test, security scan and contract verification; deployments are declarative and reproducible.
+
+- **Progressive delivery. **Canary and blue/green releases with automated rollback on SLO breach; feature flags decouple deploy from release and allow per-tenant rollout.
+
+## 12.2 Observability and reliability
+
+- **Three pillars + SLOs. **Distributed tracing, metrics and structured logs are standard via the service template; each critical journey has an SLO and an error budget that governs release pace.
+
+- **Self-healing ****&**** resilience. **Health-based restarts, autoscaling, circuit breakers, bulkheads and graceful degradation keep the system up without human intervention for common faults.
+
+- **Disaster recovery. **Multi-AZ by default; cross-region DR for critical data; recovery rehearsed against the RPO/RTO targets.
+
+## 12.3 Running the service
+
+- **SRE ****&**** incident management. **On-call, defined severities, blameless post-incident reviews, and runbooks for known conditions.
+
+- **Change management. **Backward-compatible-by-default APIs and schema evolution; deprecation windows; tenant-aware change windows for siloed tenants.
+
+- **Support tiers ****&**** SLAs. **Tiered support with response/resolution SLAs, a public status page, and a defined post-go-live hyper-care period for each new carrier.
+
+- **FinOps. **Per-tenant cost visibility from the same tenant tagging used for observability, so unit economics are known and optimised.
+
+# 13. Technology Stack (Indicative)
+
+Indicative choices to frame trade-offs; the architecture board ratifies the specifics. The constraint is consistency — one paved road, not many.
+
+| **Concern** | **Indicative choice** | **Rationale** |
+| --- | --- | --- |
+| Compute / orchestration | Containers on Kubernetes; IaC; multi-AZ/region | Portability, elasticity, self-healing |
+| Service comms | REST/JSON + async events; gRPC on hot internal paths | Interop with standards + performance where needed |
+| Messaging / streaming | Durable log (Kafka-class) | Events as integration + audit + replay |
+| Transactional data | Strongly-consistent relational store | Correctness for orders/inventory/payments |
+| Offer / document data | Document store with TTL | Ephemeral, read-optimised offers |
+| Analytics | Lake + warehouse | Decoupled analytics & ML |
+| API management | Gateway + OpenAPI/NDC schemas + sandbox | Versioning, quotas, partner onboarding |
+| Identity | OAuth2/OIDC, mTLS, RBAC/ABAC | Zero-trust, fine-grained access |
+| Observability | Tracing + metrics + logs, tenant-tagged | SLOs, per-tenant insight |
+| CI/CD | Pipeline + GitOps + signing | Repeatable, safe, auditable delivery |
+| AI / pricing | Pluggable in-house optimisation services | Dynamic pricing as a built differentiator |
+
+*Technology choices are indicative — recorded to frame trade-offs, to be ratified by the architecture board.*
+
+# 14. Architecture Governance and Ways of Working
+
+- **Architecture Decision Records (ADRs). **Significant decisions are captured as ADRs with context and consequences, giving a durable rationale trail.
+
+- **Architecture board ****&**** paved-road ownership. **A standing board ratifies cross-cutting choices and owns the platform framework so it stays coherent.
+
+- **Fitness functions. **Automated checks enforce key rules in CI — no cross-module database access, contract compatibility, telemetry presence, tenant-scoping — so principles are guaranteed, not merely encouraged.
+
+- **Definition of done. **A module is 'done' only with its contract, tests, telemetry, runbook and security checks — operability is part of the deliverable, not an afterthought.
+
+- **Tech radar. **A curated, evolving view of adopted/trial/hold technologies keeps the stack consistent while allowing controlled innovation.
+
+# 15. Delivery Approach and Team Topology
+
+The engineering sequence follows the roadmap phases from v0.1, with one ordering rule specific to this design: build the platform framework and a thin end-to-end slice first, then widen.
+
+- **Foundation first. **Phase 0 stands up the paved road (identity, config, observability, event backbone, CI/CD, the service template) and the Order domain model — the substrate everything else reuses.
+
+- **Walking skeleton. **Phase 1 delivers a thin but complete vertical slice — shop → offer → order → pay on direct channels — proving the architecture end-to-end before breadth is added.
+
+- **Widen by phase. **Retailing and distribution (Phase 2), delivery and operations (Phase 3), then native Offer & Order and AI (Phase 4), each a usable, sellable increment.
+
+- **Team topology. **A platform team owns the paved road; stream-aligned teams own modules end-to-end (build and run); enabling teams help with adoption. Team boundaries mirror module boundaries (Conway's law), reinforcing modularity.
+
+# 16. Risks and Mitigations (Engineering & Platform)
+
+These complement the programme-level risks in v0.1, focusing on the platform and SaaS model.
+
+| **Risk** | **Mitigation** |
+| --- | --- |
+| Distributed-systems complexity (partial failures, consistency bugs) | Solve hard problems once on the paved road (idempotency, outbox, sagas); strong consistency only where required; contract & chaos testing. |
+| Multi-tenant data leakage | Tenant context enforced at every boundary; per-tenant keys; fitness functions rejecting un-scoped access; regular isolation testing. |
+| Noisy-neighbour contention | Per-tenant quotas/rate limits and workload isolation; siloed tier for the most demanding tenants. |
+| Per-tenant customization creep (the maintenance killer) | Config-over-code enforced; no code forks; new needs extend the configuration model, reviewed by the architecture board. |
+| Standards drift (NDC/ONE Order schema evolution) | Standards behind adapters; automated conformance tests; track IATA schema generations. |
+| Operational toil growing with tenant count | Automation-first ops, SLOs/error budgets, self-healing, automated tenant provisioning. |
+| Safety-critical correctness (W&B, boarding) | Highest availability tier, certification rigour, strong consistency, exhaustive testing for these modules. |
+| Coexistence/bridge fragility during transition | Treat bridges as first-class, tested products; keep legacy authoritative until the new path is proven per carrier. |
+
+# 17. Open Design Decisions
+
+These shape detailed design and should be ratified by the architecture board. They extend the open questions in v0.1.
+
+- Default tenant isolation tier and the criteria for promoting a tenant from pooled to bridged to siloed.
+
+- Cloud provider(s) and whether to remain portable or adopt managed provider services for speed.
+
+- Primary implementation language(s) and the permitted set, to keep the paved road coherent.
+
+- Build-order detail of the Phase-1 vertical slice (which channels, which carrier-type configuration first).
+
+- Extent of in-house dynamic-pricing/AI at launch versus a later phase, and its data dependencies.
+
+- Consistency boundaries — confirming exactly which operations require strong consistency versus eventual.
+
+- Commercial metering model (subscription / transaction / hybrid) and the usage signals to meter from day one.
+
+# 18. Appendix
+
+## 18.1 Glossary (supplementary)
+
+Extends the v0.1 glossary with terms used in this document; see v0.1 for PSS/CRS/DCS/PNR/EMD/NDC/ONE Order/OOSD/etc.
+
+| **Term** | **Meaning** |
+| --- | --- |
+| Bounded context | A module boundary owning its own model, data and contract (domain-driven design). |
+| Paved road | The shared platform framework every module is built on; the supported, automated default path. |
+| Service template | A scaffold that creates a new module pre-wired for the paved road. |
+| Multi-tenancy | One codebase and control plane serving many isolated, individually-configured tenants. |
+| Pooled / Bridged / Siloed | The three tenant isolation tiers (shared data / dedicated data / dedicated stack). |
+| Saga | A coordinated multi-service transaction with compensating actions on failure. |
+| Transactional outbox | Persisting state and its event atomically, then publishing reliably. |
+| CQRS | Separating write models from purpose-built read models. |
+| SLO / error budget | A reliability target and the allowance for falling short, governing release pace. |
+| GitOps | Declarative, version-controlled deployment driven from git. |
+| Fitness function | An automated test that enforces an architectural rule. |
+| RP 1786a | IATA Reference Business Architecture for passenger distribution with Offers and Orders. |
+| SRSIA | Standard Retailer and Supplier Interline Agreement (order-based interline). |
+
+## 18.2 Standards reference
+
+| **Standard / artefact** | **Reference** |
+| --- | --- |
+| IATA Modern Airline Retailing / Offers & Orders | iata.org — airline distribution / retailing |
+| NDC | IATA Resolution 787 and resulting schemas |
+| ONE Order | IATA Resolution 797 and resulting schemas |
+| Settlement with Orders | IATA Resolution 750a and resulting schemas |
+| Reference Business Architecture | IATA Recommended Practice 1786a |
+| Product Management Information | IATA Recommended Practice 1730 |
+| Retailer–Supplier Interline (SRSIA) | IATA Recommended Practice 1780s |
+| Digitalisation of Admissibility | IATA Recommended Practice 1701p |
+
+*This SDD is a working draft companion to the v0.1 discovery document. Indicative figures and technology choices are directional inputs to be ratified, not settled facts.*
+
+	© 2026 Aurionpro Solutions Limited  ·  Confidential — internal working document	Page  of

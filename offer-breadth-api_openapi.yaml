@@ -1,0 +1,374 @@
+openapi: 3.0.3
+info:
+  title: PSS Tranche-1 Offer Breadth Contract Additions
+  version: 0.2.0
+  description: >
+    Contract-first artifact realising BREADTH_DELTA_0_2_MULTIPAX_RETURN.md §3
+    (two-stage shopping, CombineAndPrice, per-(passenger × segment) items).
+    Resolves FLAG-002. Delta-file convention as ancillary-api.openapi.yaml: these
+    paths/components merge into offer-api.openapi.yaml; where a component here and
+    the Phase-1 contract share a name, THIS file governs for Tranche 1.
+
+    Backward compatibility (the delta's "zero contract breaks" promise, made precise):
+    - ONE_WAY shopping returns a single direction whose offers carry stage=JOURNEY
+      and are directly orderable — the Phase-1 flow is unchanged in behaviour.
+    - RETURN shopping returns two directions of stage=CANDIDATE offers; only the
+      CombineAndPrice result (stage=JOURNEY) is orderable. Order rejects
+      stage!=JOURNEY with OFFER_NOT_ORDERABLE (Order-side; code listed here for
+      the shared Problem registry).
+    - OfferItem is EXTENDED (per-passenger, per-segment, with its quote slice);
+      `amount` keeps its Phase-1 meaning (the item's total). Invariant:
+      Σ items[].amount = grandTotal — property-tested at assembly and at Order.
+
+    Harmonisation note for the merge: ancillary-api.openapi.yaml carries a local
+    OfferItem for AugmentedOffer. On merge into offer-api, the canonical OfferItem
+    is THIS file's shape plus the ancillary fields (attributes, priceRef,
+    type=ANCILLARY); the ancillary file's local copy is then replaced by a $ref.
+    Until the merge, the two delta files are each authoritative for their own
+    endpoints — D2 generates AugmentedOffer items against this canonical shape.
+
+    Conventions as the Order/Payments/Ancillary specs: tenant from the verified
+    bearer token; Idempotency-Key on state-creating calls; RFC 9457 problem+json
+    with stable codes.
+servers:
+  - url: https://api.pss.internal
+security:
+  - bearerAuth: []
+tags:
+  - name: offer
+
+paths:
+  /v1/offers/shop:
+    post:
+      operationId: shop
+      tags: [offer]
+      summary: Shop (Stage 1) — direction-grouped, multi-passenger.
+      description: >
+        EXTENDS the Phase-1 operation. ONE_WAY → one direction of JOURNEY offers
+        (directly orderable, Phase-1 behaviour). RETURN → two directions of
+        CANDIDATE offers for CombineAndPrice. Partial failure degrades a
+        direction's breadth, never errors the whole shop (delta §3.1 / LLD §4.2).
+        Naturally idempotent — no Idempotency-Key.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ShopRequest' }
+      responses:
+        '200':
+          description: Direction-grouped offers.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ShopResponse' }
+        '422':
+          description: >
+            Unsupported passenger mix. code = PTC_NOT_SUPPORTED (non-ADT) or
+            PRICING_PAX_LIMIT_EXCEEDED (Σ count > 9).
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        default:
+          $ref: '#/components/responses/CommonError'
+
+  /v1/offers/combine:
+    post:
+      operationId: combineAndPrice
+      tags: [offer]
+      summary: CombineAndPrice (Stage 2) — candidates → one JOURNEY offer.
+      description: >
+        Takes 1–2 candidate offers (one per direction; one for ONE_WAY
+        pass-through) and produces a single immutable JOURNEY offer: one
+        PriceItinerary across all directions, items per (passenger × segment).
+        Creates an offer → Idempotency-Key required.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [candidateOfferIds]
+              properties:
+                candidateOfferIds:
+                  type: array
+                  minItems: 1
+                  maxItems: 2
+                  items: { $ref: '#/components/schemas/Ulid' }
+                  description: Exactly one per direction, outbound first.
+      responses:
+        '201':
+          description: The combined JOURNEY offer.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Offer' }
+        '404':
+          description: A candidate is not visible to the tenant, or evicted.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '410':
+          description: A candidate is past validUntil. code = OFFER_EXPIRED.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '422':
+          description: >
+            Candidates do not form one journey (mixed shopping contexts,
+            same direction twice, pax-set mismatch, wrong count for trip type).
+            code = CANDIDATES_INCOMPATIBLE.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        default:
+          $ref: '#/components/responses/CommonError'
+
+  /v1/offers/{offerId}:
+    get:
+      operationId: getOffer
+      tags: [offer]
+      summary: Retrieve an offer (now stage-aware).
+      description: >
+        EXTENDS the Phase-1 operation: the Offer schema gains `stage`.
+        Order calls this at CreateOrder and MUST reject stage != JOURNEY
+        with 422 OFFER_NOT_ORDERABLE.
+      parameters:
+        - name: offerId
+          in: path
+          required: true
+          schema: { $ref: '#/components/schemas/Ulid' }
+      responses:
+        '200':
+          description: The offer.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Offer' }
+        '404':
+          description: Not visible to the tenant, or evicted.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '410':
+          description: Found but past validUntil. code = OFFER_EXPIRED.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        default:
+          $ref: '#/components/responses/CommonError'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: { type: string, maxLength: 255 }
+      description: Client-generated key; duplicate submission returns the original result.
+  responses:
+    CommonError:
+      description: 400/401/403/502/503 per platform conventions.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+  schemas:
+    Ulid:
+      type: string
+      pattern: '^[0-9A-HJKMNP-TV-Z]{26}$'
+    Currency:
+      type: string
+      pattern: '^[A-Z]{3}$'
+    Iata:
+      type: string
+      pattern: '^[A-Z]{3}$'
+    Money:
+      type: object
+      additionalProperties: false
+      required: [amount, currency]
+      properties:
+        amount: { type: number }
+        currency: { $ref: '#/components/schemas/Currency' }
+    TaxLine:
+      type: object
+      additionalProperties: false
+      required: [code, amount]
+      properties:
+        code: { type: string, description: e.g. GST }
+        amount: { $ref: '#/components/schemas/Money' }
+    PassengerSpec:
+      type: object
+      additionalProperties: false
+      required: [ptc, count]
+      properties:
+        ptc:
+          type: string
+          enum: [ADT]
+          description: Tranche 1 is ADT-only; CHD/INF deferred (delta §12).
+        count: { type: integer, minimum: 1, maximum: 9 }
+    PointOfSale:
+      type: object
+      additionalProperties: false
+      required: [country, currency, channel]
+      properties:
+        country: { type: string, pattern: '^[A-Z]{2}$' }
+        currency: { $ref: '#/components/schemas/Currency' }
+        channel: { type: string, enum: [WEB, MOBILE, AGENT, API] }
+    ShopRequest:
+      type: object
+      additionalProperties: false
+      required: [origin, destination, departureDate, tripType, passengers, pointOfSale]
+      properties:
+        origin: { $ref: '#/components/schemas/Iata' }
+        destination: { $ref: '#/components/schemas/Iata' }
+        tripType: { type: string, enum: [ONE_WAY, RETURN] }
+        departureDate: { type: string, format: date }
+        returnDate:
+          type: string
+          format: date
+          description: Required iff tripType = RETURN (validated server-side).
+        passengers:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/PassengerSpec' }
+          description: 'Σ count ≤ 9; positional paxRefs P1…Pn assigned in order.'
+        pointOfSale: { $ref: '#/components/schemas/PointOfSale' }
+    ShopResponse:
+      type: object
+      additionalProperties: false
+      required: [searchId, tripType, directions]
+      properties:
+        searchId:
+          $ref: '#/components/schemas/Ulid'
+        tripType: { type: string, enum: [ONE_WAY, RETURN] }
+        directions:
+          type: array
+          minItems: 1
+          maxItems: 2
+          items: { $ref: '#/components/schemas/Direction' }
+    Direction:
+      type: object
+      additionalProperties: false
+      required: [directionIndex, origin, destination, departureDate, offers]
+      properties:
+        directionIndex:
+          type: integer
+          enum: [0, 1]
+          description: 0 = outbound, 1 = return.
+        origin: { $ref: '#/components/schemas/Iata' }
+        destination: { $ref: '#/components/schemas/Iata' }
+        departureDate: { type: string, format: date }
+        offers:
+          type: array
+          items: { $ref: '#/components/schemas/Offer' }
+          description: >
+            stage=JOURNEY for ONE_WAY (orderable); stage=CANDIDATE for RETURN
+            (combine first). Empty array = degraded/no availability for this
+            direction (partial failure, not an error).
+    Offer:
+      type: object
+      additionalProperties: false
+      required: [offerId, stage, status, currency, grandTotal, validUntil, items]
+      properties:
+        offerId: { $ref: '#/components/schemas/Ulid' }
+        stage:
+          type: string
+          enum: [CANDIDATE, JOURNEY]
+          description: Only JOURNEY is orderable; Order enforces OFFER_NOT_ORDERABLE.
+        status: { type: string, enum: [VALID, EXPIRED, ACCEPTED] }
+        combinedFrom:
+          type: array
+          maxItems: 2
+          items: { $ref: '#/components/schemas/Ulid' }
+          description: Present on a JOURNEY produced by combine — the candidate ids.
+        supersedes:
+          $ref: '#/components/schemas/Ulid'
+        currency: { $ref: '#/components/schemas/Currency' }
+        grandTotal:
+          type: number
+          description: 'Money invariant: Σ items[].amount = grandTotal.'
+        validUntil: { type: string, format: date-time }
+        quoteRef: { type: string, description: The PriceQuote behind the air items. }
+        ancillaryQuoteRef: { type: string, description: Present after AugmentOffer (ancillary delta). }
+        passengers:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [paxRef, ptc]
+            properties:
+              paxRef: { type: string, description: 'P1…Pn, positional.' }
+              ptc: { type: string, enum: [ADT] }
+        items:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/OfferItem' }
+        summary:
+          type: object
+          additionalProperties: true
+          description: Display-only (times, fareBasis); never used for pricing or ordering.
+    OfferItem:
+      type: object
+      additionalProperties: false
+      required: [itemRef, type, amount]
+      description: >
+        CANONICAL Tranche-1 item shape (supersedes the Phase-1
+        {type, productRef, segments, cabin, rbd, amount}). FLIGHT items are one per
+        (passenger × segment), each carrying its own quote slice. ANCILLARY fields
+        per the ancillary delta. amount = the item's total (base + taxes).
+      properties:
+        itemRef: { type: string, description: Stable within the offer; Order materialises 1:1. }
+        type: { type: string, enum: [FLIGHT, ANCILLARY] }
+        productRef:
+          type: string
+          description: flightInventoryId (FLIGHT) or ancillary code (ANCILLARY).
+        directionIndex: { type: integer, enum: [0, 1] }
+        segmentRef:
+          type: string
+          description: One segment per FLIGHT item (e.g. BLR-BOM/2026-07-15/PS123).
+        paxRef: { type: string, description: 'P1…Pn.' }
+        ptc: { type: string, enum: [ADT] }
+        base: { $ref: '#/components/schemas/Money' }
+        taxLines:
+          type: array
+          items: { $ref: '#/components/schemas/TaxLine' }
+        amount:
+          type: number
+          description: Item total in the offer currency (Phase-1 meaning preserved).
+        cabin: { type: string }
+        rbd: { type: string }
+        attributes:
+          type: object
+          additionalProperties: false
+          properties:
+            seatNumber: { type: string, pattern: '^[0-9]{1,2}[A-K]$' }
+        priceRef:
+          type: string
+          description: Into the PriceQuote (FLIGHT) or AncillaryQuote (ANCILLARY).
+    Problem:
+      type: object
+      description: RFC 9457 problem details with a stable machine-readable code.
+      required: [type, title, status, code]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        code:
+          type: string
+          enum:
+            - CANDIDATES_INCOMPATIBLE
+            - OFFER_EXPIRED
+            - OFFER_NOT_ORDERABLE
+            - PTC_NOT_SUPPORTED
+            - PRICING_PAX_LIMIT_EXCEEDED
+            - VALIDATION_FAILED
+            - UNAUTHORIZED
+            - FORBIDDEN
+            - NOT_FOUND
+            - CONFLICT
+            - DOWNSTREAM_UNAVAILABLE

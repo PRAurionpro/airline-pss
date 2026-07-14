@@ -1,0 +1,206 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.pss/aurionpro/order/order-events.schema.json",
+  "title": "Order module domain events",
+  "description": "Published domain events for the Order module (Order LLD §6). Every event shares the common envelope; the concrete event is selected by the 'type' constant. Consumers MUST be idempotent on eventId.",
+  "$defs": {
+    "Ulid": {
+      "type": "string",
+      "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$",
+      "description": "ULID identifier."
+    },
+    "Currency": {
+      "type": "string",
+      "pattern": "^[A-Z]{3}$",
+      "description": "ISO-4217 currency code."
+    },
+    "Money": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["amount", "currency"],
+      "properties": {
+        "amount": { "type": "number" },
+        "currency": { "$ref": "#/$defs/Currency" }
+      }
+    },
+    "OrderItemType": {
+      "type": "string",
+      "enum": ["AIR", "ANCILLARY", "SERVICE"]
+    },
+    "EnvelopeBase": {
+      "type": "object",
+      "required": ["eventId", "type", "version", "tenantId", "orderId", "occurredAt"],
+      "properties": {
+        "eventId": { "$ref": "#/$defs/Ulid", "description": "Unique event id; idempotency key for consumers." },
+        "type": { "type": "string", "description": "Event type discriminator." },
+        "version": { "type": "integer", "minimum": 1, "description": "Schema version of this event type." },
+        "tenantId": { "type": "string", "description": "Owning tenant." },
+        "orderId": { "$ref": "#/$defs/Ulid" },
+        "occurredAt": { "type": "string", "format": "date-time" },
+        "correlationId": { "type": "string", "description": "End-to-end correlation id for tracing." },
+        "causationId": { "type": "string", "description": "Id of the command/event that caused this one." }
+      }
+    },
+    "Totals": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["currency", "totalAmount", "balanceDue"],
+      "properties": {
+        "currency": { "$ref": "#/$defs/Currency" },
+        "totalAmount": { "type": "number" },
+        "balanceDue": { "type": "number" }
+      }
+    },
+    "OrderCreated": {
+      "allOf": [{ "$ref": "#/$defs/EnvelopeBase" }],
+      "required": ["payload"],
+      "properties": {
+        "type": { "const": "OrderCreated" },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["orderRef", "items", "totals"],
+          "properties": {
+            "orderRef": { "type": "string" },
+            "offerRef": { "type": "string" },
+            "totals": { "$ref": "#/$defs/Totals" },
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["orderItemId", "type"],
+                "properties": {
+                  "orderItemId": { "$ref": "#/$defs/Ulid" },
+                  "type": { "$ref": "#/$defs/OrderItemType" },
+                  "passengerRef": { "type": "string" },
+                  "price": { "$ref": "#/$defs/Money" }
+                }
+              }
+            },
+            "passengers": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["passengerId", "ptc"],
+                "properties": {
+                  "passengerId": { "$ref": "#/$defs/Ulid" },
+                  "ptc": { "type": "string", "enum": ["ADT", "CHD", "INF"] }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "OrderConfirmed": {
+      "allOf": [{ "$ref": "#/$defs/EnvelopeBase" }],
+      "required": ["payload"],
+      "properties": {
+        "type": { "const": "OrderConfirmed" },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["amountPaid"],
+          "properties": {
+            "amountPaid": { "type": "number" },
+            "documentRefs": {
+              "type": "array",
+              "items": { "type": "string", "description": "e-ticket / EMD numbers issued." }
+            }
+          }
+        }
+      }
+    },
+    "OrderItemAdded": {
+      "allOf": [{ "$ref": "#/$defs/EnvelopeBase" }],
+      "required": ["payload"],
+      "properties": {
+        "type": { "const": "OrderItemAdded" },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["orderItemId", "itemType"],
+          "properties": {
+            "orderItemId": { "$ref": "#/$defs/Ulid" },
+            "itemType": { "$ref": "#/$defs/OrderItemType" },
+            "price": { "$ref": "#/$defs/Money" }
+          }
+        }
+      }
+    },
+    "OrderItemCancelled": {
+      "allOf": [{ "$ref": "#/$defs/EnvelopeBase" }],
+      "required": ["payload"],
+      "properties": {
+        "type": { "const": "OrderItemCancelled" },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["orderItemId"],
+          "properties": {
+            "orderItemId": { "$ref": "#/$defs/Ulid" },
+            "refundRef": { "type": ["string", "null"] }
+          }
+        }
+      }
+    },
+    "OrderChanged": {
+      "allOf": [{ "$ref": "#/$defs/EnvelopeBase" }],
+      "required": ["payload"],
+      "properties": {
+        "type": { "const": "OrderChanged" },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["changeType", "newTotal"],
+          "properties": {
+            "changeType": { "type": "string", "enum": ["ADD_ITEM", "CANCEL_ITEM", "EXCHANGE_ITEM", "REPRICE"] },
+            "newTotal": { "type": "number" }
+          }
+        }
+      }
+    },
+    "OrderCancelled": {
+      "allOf": [{ "$ref": "#/$defs/EnvelopeBase" }],
+      "required": ["payload"],
+      "properties": {
+        "type": { "const": "OrderCancelled" },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["reason"],
+          "properties": {
+            "reason": { "type": "string", "enum": ["CUSTOMER_REQUEST", "AIRLINE_INITIATED", "FRAUD", "EXPIRED", "OTHER"] },
+            "refundRef": { "type": ["string", "null"] }
+          }
+        }
+      }
+    },
+    "OrderFulfilled": {
+      "allOf": [{ "$ref": "#/$defs/EnvelopeBase" }],
+      "required": ["payload"],
+      "properties": {
+        "type": { "const": "OrderFulfilled" },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["fulfilledAt"],
+          "properties": {
+            "fulfilledAt": { "type": "string", "format": "date-time" }
+          }
+        }
+      }
+    }
+  },
+  "oneOf": [
+    { "$ref": "#/$defs/OrderCreated" },
+    { "$ref": "#/$defs/OrderConfirmed" },
+    { "$ref": "#/$defs/OrderItemAdded" },
+    { "$ref": "#/$defs/OrderItemCancelled" },
+    { "$ref": "#/$defs/OrderChanged" },
+    { "$ref": "#/$defs/OrderCancelled" },
+    { "$ref": "#/$defs/OrderFulfilled" }
+  ]
+}

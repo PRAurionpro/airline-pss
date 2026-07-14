@@ -1,0 +1,309 @@
+PSS — Pricing & Fares LLD	Working Draft v0.1
+
+**PASSENGER SERVICE SYSTEM (PSS)**
+
+**Pricing ****&**** Fares Module — Low-Level Design**
+
+*Deterministic, reproducible quotes · filed fares now, dynamic/AI later (pluggable)*
+
+Version 0.1 — Working Draft
+
+Prepared: June 2026
+
+Companion to: SDD (v0.2), Build Plan, Order LLD, Inventory LLD, PSS_Landscape_Design_Roadmap_3.docx
+
+**Prepared by Aurionpro Solutions Limited**
+
+**Table of Contents**
+
+# 1. Introduction and Scope
+
+## 1.1 Purpose
+
+This is the low-level design (LLD) for the Pricing & Fares module — the third Phase-1-critical module, and the one that turns an itinerary into money. It is consumed by Offer (to price shopping results) and by Order (to reprice on change), so its output must be deterministic, reproducible and auditable. The document takes the Pricing summary from the System Design Document (SDD §5.2) down to buildable detail: the domain model, the pricing pipeline, the fare/rule/tax model, quote determinism and validity, repricing, the API contract, the events and the persistence design.
+
+## 1.2 Relationship to companion documents
+
+This LLD conforms to the SDD (v0.2) and is sequenced by the Phase 0 & Phase 1 Build Plan (Pricing is part of the M5 milestone). It pairs with the Order LLD (which calls Reprice) and the Inventory LLD (which supplies the flights/classes being priced). Decision D9 governs it directly: filed fares in Phase 1, dynamic/continuous and AI-assisted pricing in Phase 4, delivered behind a pluggable strategy from day one. Decision D3 (India first) drives GST and the point-of-sale model.
+
+## 1.3 Scope
+
+The full target model is specified; the Phase-1 subset (filed fares, the fare-rule categories needed for booking and change, tax computation including GST, FX conversion, and deterministic repricing) is in Section 14. Dynamic/continuous pricing, AI optimisation, and advanced fare construction (complex routings, mixed-cabin, interline proration) are designed for but deferred.
+
+## 1.4 Conventions
+
+API and field names are in monospace; example payloads are illustrative. Money is an amount plus an ISO-4217 currency. 'Fare basis' is the code identifying a fare; 'RBD' is the booking class; 'point of sale' is the selling country/currency/channel context; 'YQ/YR' are carrier-imposed surcharges; 'PSF' is a passenger service fee. Times are UTC.
+
+# 2. Responsibilities and Boundaries
+
+## 2.1 What the Pricing & Fares module owns
+
+- Fare construction: selecting applicable fares for an itinerary and computing the base fare under the fare rules.
+
+- Tax, fee and surcharge computation (including GST for India) producing a full, itemised breakdown.
+
+- FX conversion to the point-of-sale currency and currency rounding.
+
+- The PriceQuote — an immutable, versioned, time-bounded result — and deterministic repricing on change.
+
+- The pluggable pricing strategy (filed today, dynamic/AI later) behind a stable interface.
+
+## 2.2 What the Pricing & Fares module does not own
+
+| **Concern** | **Owner** | **Pricing****'****s relationship** |
+| --- | --- | --- |
+| Flights, classes, availability | Inventory / Availability | Prices the segments/classes it is given; does not check seats. |
+| Offer assembly & personalisation | Offer Management | Provides priced fare data to Offer; Offer composes the offer. |
+| The order, payment collection, refunds | Order / Payments | Returns a price/difference; Order collects or refunds via Payments. |
+| Demand forecasting & optimisation | Revenue Management (P2/P4) | Consumes RM/dynamic signals via the pricing strategy port. |
+| FX rate sourcing | FX/reference feed | Consumes published FX rates; does not set them. |
+
+## 2.3 Dependencies
+
+**Inbound (consumes): **ScheduleChanged (affected fares), FX rate updates, RevenueManagement/dynamic-pricing signals (later). **Outbound (called by / notifies): **called by Offer (PriceItinerary) and Order (Reprice); notifies via FareFiled / FareUpdated.
+
+# 3. Domain Model
+
+## 3.1 Reference data and quote output
+
+The model has two sides: read-mostly reference data (fares, rules, taxes, FX) maintained by filing loads, and the immutable quote output computed from it. Keeping the quote separate and immutable is what makes pricing auditable and safe for Offer and Order to rely on.
+
+*Figure 1 — Pricing **&** Fares domain model: reference data (left) and the immutable PriceQuote output (right).*
+
+Reference data (read-mostly):
+
+| **Entity** | **Key fields** |
+| --- | --- |
+| Fare | fareId, tenantId, fareBasis, fareMarket (O&D), cabin, rbd, currency, baseAmount, fareType {PUBLISHED│PRIVATE│NEGOTIATED}, validity (sales/travel), status {FILED│WITHDRAWN}, version. |
+| FareRule | ruleId, fareId, category (advance purchase, min/max stay, seasonality, day/time, routing, combinability, change/refund penalties), conditions, penalties. |
+| TaxRule | taxId, code {GST│YQ│YR│PSF│…}, jurisdiction, pointOfSale, basis {per-segment│per-ticket│percentage│fixed}, rate/amount, applicability (O&D, carrier, POS). |
+| FXRate | currency pair, rate, asOf — used to convert to the point-of-sale currency. |
+
+Quote output (immutable):
+
+| **Entity** | **Key fields** |
+| --- | --- |
+| PriceQuote (root) | quoteId, tenantId, pricedAt, validUntil, currency, grandTotal, strategy {FILED│DYNAMIC}, fareDataVersion, version. |
+| FareComponent | componentId, quoteId, fareId, segments (the priced portion), baseAmount, passengerRef. |
+| TaxLine | taxLineId, quoteId, taxId, code, amount, passengerRef — one line per applied tax/fee. |
+
+# 4. The Pricing Pipeline
+
+A quote is produced by a fixed, deterministic pipeline. The same itinerary, passengers, point of sale and fare-data version always yield the same quote — which is what lets Offer cache offers and Order reprice reliably.
+
+*Figure 2 — The pricing pipeline. Fare selection and base-fare computation run behind the pluggable PricingStrategy.*
+
+| **Stage** | **What it does** |
+| --- | --- |
+| **1 Fare selection** | Find the applicable fares for each priced portion of the itinerary (by market, cabin, RBD, validity, fare type / point of sale). |
+| **2 Rule application** | Apply fare rules (advance purchase, min/max stay, day/time, routing, combinability) to qualify or disqualify fares. |
+| **3 Base fare** | Compute the base fare per passenger from the qualified fare components. |
+| **4 Taxes ****&**** surcharges** | Apply tax rules — government taxes, carrier surcharges (YQ/YR), fees, and GST for India — itemised per passenger. |
+| **5 FX ****&**** rounding** | Convert to the point-of-sale currency at the recorded FX rate and apply currency rounding. |
+
+Stages 1 and 3 delegate to the pluggable PricingStrategy (§4.1); stages 2, 4 and 5 are common to all strategies.
+
+## 4.1 The pluggable pricing strategy (D9)
+
+Fare selection and base-fare computation sit behind a PricingStrategy port. Phase 1 ships a FiledFareStrategy (deterministic lookup against filed fares). A DynamicPricingStrategy — calling an in-house optimisation/AI service that returns a price or adjustment — is added in Phase 4 with no change to the surrounding pipeline, the API or the callers. The strategy is selected per tenant and market by configuration, so a carrier can move from filed to dynamic pricing as a configuration change.
+
+# 5. Fares, Rules, Taxes and FX
+
+## 5.1 Filed fares
+
+In Phase 1 fares are filed (loaded as reference data): each fare is identified by a fare basis, scoped to a fare market (O&D), cabin and booking class(es), with a base amount, currency, fare type and validity windows for sales and travel. Filing is a controlled, versioned load (every quote records the fareDataVersion it used). The in-house filed-fare model is deliberately compatible in spirit with industry filed-fare concepts so external fare content can be mapped in later.
+
+## 5.2 Fare rules
+
+Fare rules qualify a fare and govern changes. The categories needed in Phase 1 are advance purchase, minimum/maximum stay, day/time and seasonality, routing and combinability, and — critically for servicing — change and refund penalties. Rules are evaluated deterministically during stage 2 and again at reprice time to compute penalties (§7).
+
+## 5.3 Taxes, fees and GST
+
+Taxes, fees and carrier surcharges are computed by a tax sub-engine from tax rules, each with a code, jurisdiction, point-of-sale applicability and a basis (per-segment, per-ticket, percentage or fixed). For the India first market this includes GST with the correct place-of-supply treatment, alongside carrier-imposed surcharges (YQ/YR) and applicable fees. Every tax is an itemised TaxLine on the quote — never folded into the base fare — so the breakdown is transparent and auditable for finance and regulators.
+
+## 5.4 FX and rounding
+
+Filed amounts are converted to the point-of-sale currency using the FX rate in force, recorded on the quote (asOf), and rounded per currency rules. Recording the rate keeps the quote reproducible even after rates move.
+
+# 6. Determinism, Versioning and Quote Validity
+
+A PriceQuote is immutable and reproducible: given the same itinerary, passengers, point of sale and fareDataVersion, the pipeline produces an identical quote. This property is what the rest of the platform relies on:
+
+- **Immutability. **A quote is never edited; a change produces a new quote that supersedes the old one.
+
+- **Versioning. **Each quote records the fareDataVersion and strategy used, so it can be explained and recomputed exactly later.
+
+- **Validity window. **Each quote has a validUntil; past it the price is stale and must be re-quoted. Offer honours this when constructing offers, and Order re-validates price at order creation.
+
+- **Auditability. **The fare components, tax lines, FX rate and versions on the quote fully explain how the total was reached.
+
+# 7. Reprice and Change Pricing
+
+When the Order module applies a change (add / cancel / exchange an item), it calls Reprice. Pricing recomputes the quote under the current fares and rules and returns a Difference, which the Order then settles by collecting more or issuing a refund.
+
+*Figure 3 — Reprice on change: recompute, apply the fare-rule penalty, and return the difference.*
+
+The difference combines the fare difference (new fare components minus the value already paid, i.e. the residual), plus any change penalty derived from the fare rules. A positive difference is an additional collection (Order initiates a payment), a negative difference is a refund, and zero is an even exchange. Because repricing is deterministic, the same change against the same fare-data version always yields the same difference.
+
+# 8. API Contract
+
+Internal platform APIs over the gateway; REST/JSON; tenant from the verified token. Pricing operations are read-style (no side effects beyond producing/storing a quote) but are deterministic and versioned.
+
+## 8.1 PriceItinerary
+
+POST /v1/price  — price an itinerary for given passengers and point of sale; returns a PriceQuote.
+
+| *Illustrative* POST /v1/price { "itinerary": { "segments":[      {"flightInventoryId":"01HZ...","origin":"BLR","destination":"BOM",       "cabin":"Y","rbd":"B","departure":"2026-07-15T06:10:00+05:30"} ] },   "passengers":[ {"ptc":"ADT","count":1} ],   "pointOfSale":{ "country":"IN","currency":"INR","channel":"WEB" } } 200 OK { "quoteId":"01HQ...", "currency":"INR", "validUntil":"2026-07-01T10:20:00Z",   "grandTotal":5499.00,   "perPassenger":[ {"ptc":"ADT","baseFare":4200.00,       "taxes":[ {"code":"GST","amount":210.00}, {"code":"YR","amount":1089.00} ],       "total":5499.00} ],   "fareComponents":[ {"fareBasis":"BL1XIN","fareId":"01HF...",       "segments":["BLR-BOM"],"baseAmount":4200.00} ],   "strategy":"FILED", "fareDataVersion":"2026-06-30" } |
+| --- |
+
+## 8.2 Reprice
+
+POST /v1/price/reprice  — reprice an existing order under a proposed change; returns the new quote and the difference.
+
+| *Illustrative* POST /v1/price/reprice { "orderId":"01HZX...",   "change":{ "operation":"ADD_ITEM",              "item":{"type":"ANCILLARY","productRef":"BAG_20KG","passengerRef":"P1"} } } 200 OK { "newQuoteId":"01HR...",   "difference":{ "fareDifference":0, "changePenalty":0,                  "amount":700.00, "currency":"INR", "action":"COLLECT" } } |
+| --- |
+
+## 8.3 QuoteTaxes and GetFareRules
+
+POST /v1/taxes  — return the itemised tax/fee breakdown for an itinerary (used where only taxes are needed). GET /v1/fares/{fareBasis}/rules  — return a summary of the rules for a fare (for display and servicing).
+
+## 8.4 Error model
+
+| **HTTP** | **Condition** |
+| --- | --- |
+| 400 / 401 / 403 | Validation, authorisation or tenant-context failure. |
+| 404 Not Found | Order/quote/fare not visible to the tenant. |
+| 422 Unprocessable | No applicable fare for the itinerary; or the requested change is not permitted by fare rules. |
+| 409 Conflict | Fare data changed under a concurrent filing load during the request (retry). |
+
+# 9. Domain Events
+
+Events share the platform envelope and the transactional outbox; consumers are idempotent on eventId.
+
+## 9.1 Published
+
+| **Event** | **Emitted when** | **Key payload** |
+| --- | --- | --- |
+| FareFiled | A new/changed fare is loaded and becomes active | fareId, fareBasis, fareMarket, validity, fareDataVersion |
+| FareUpdated | A fare or its rules change / are withdrawn | fareId, change summary, fareDataVersion |
+
+## 9.2 Consumed
+
+| **Event (source)** | **Effect** |
+| --- | --- |
+| ScheduleChanged (Schedule & Flight) | Re-evaluate fares affected by a flight retime/cancellation; flag stale quotes. |
+| FX rate update (FX feed) | Refresh the FX rates used for conversion. |
+| RevenueManagement / dynamic-pricing signals (P2/P4) | Feed the DynamicPricingStrategy when enabled. |
+
+# 10. Interaction with Offer and Order
+
+| **Caller** | **Calls** | **Why** |
+| --- | --- | --- |
+| Offer Management | PriceItinerary / QuoteTaxes | To price shopping results into offers (offers carry the quote and its validUntil). |
+| Order Management | PriceItinerary (re-validate) | At order creation, to confirm the offer's price is still valid before committing. |
+| Order Management | Reprice | On a change, to compute the difference to collect or refund. |
+
+Pricing holds no order or inventory state; it is a deterministic function over reference data plus inputs. This keeps it horizontally scalable and easy to reason about.
+
+# 11. Persistence and Data Design
+
+## 11.1 Stores
+
+Reference data is read-mostly and heavily cached; quotes are written and retained for audit. Pricing owns both stores; no other module reads them directly.
+
+| **Store / table** | **Holds** |
+| --- | --- |
+| fares / fare_rules | Filed fares and their rules (versioned by filing load). |
+| tax_rules | Tax, fee and surcharge rules by code, jurisdiction and point of sale. |
+| fx_rates | Currency rates with asOf timestamps. |
+| price_quotes / fare_components / tax_lines | Immutable quotes and their breakdown, retained for audit. |
+| pricing_events_outbox | FareFiled / FareUpdated events written with the reference change. |
+
+## 11.2 Reference-data lifecycle and caching
+
+Fares, rules and taxes change through controlled filing loads, each producing a new fareDataVersion. Because the data is read-mostly and pricing is latency-sensitive, it is aggressively cached (with the version as the cache key); a new filing load swaps the active version atomically so in-flight quotes are never priced from a half-loaded dataset.
+
+## 11.3 Multi-tenancy, audit and recovery
+
+All data is tenant-scoped (pooled tier) and resident in the tenant's region (India first). Quotes are immutable and retained as the pricing audit trail (with fareDataVersion, strategy, FX rate); combined with the reference-data versions, any past price is fully explainable and recomputable. Reference data is recoverable by re-running filing loads; quotes are protected by normal backup/replication.
+
+# 12. Cross-Cutting Concerns
+
+- **Determinism over idempotency. **Pricing has few side effects; the key guarantee is that identical inputs + fareDataVersion produce identical quotes, so retries and recomputations are inherently safe.
+
+- **Observability. **Traced operations; metrics on price latency, cache hit-rate, no-fare-found rate and strategy mix; an SLO on PriceItinerary latency.
+
+- **Configuration. **Per-tenant/market: the active PricingStrategy (filed/dynamic), rounding rules, default point of sale — all config-over-code.
+
+- **Security. **RBAC/ABAC; fare filing restricted to pricing/RM roles; private/negotiated fares gated by entitlement and point of sale.
+
+# 13. Non-Functional Targets (Pricing module)
+
+| **Dimension** | **Target (to ratify)** |
+| --- | --- |
+| **Pricing latency** | PriceItinerary p95 sub-second on the shopping path (cached reference data); Reprice within a low single-digit-second budget. |
+| **Determinism** | Identical inputs + fareDataVersion → byte-identical quote; reprice differences reproducible. |
+| **Throughput ****&**** scale** | Stateless and horizontally scalable; scales with shopping volume; cache-backed reference reads. |
+| **Availability** | Critical-path tier (≥ 99.95%) — pricing is on the shopping and booking paths. |
+| **Correctness** | Tax/GST and fare-rule outcomes verified against authoritative test cases; totals reconcile to components + taxes. |
+| **Auditability** | Every quote fully explains its total (components, taxes, FX, versions) and is retained. |
+
+# 14. Phase-1 Scope vs Full Design
+
+| **Built in Phase 1** | **Designed, deferred** |
+| --- | --- |
+| Filed fares + FiledFareStrategy | Dynamic / continuous + AI pricing strategy (P4) |
+| Fare rules: AP, min/max stay, day/time, routing, change/refund | Full fare-rule category set; complex combinability |
+| Tax engine incl. GST; YQ/YR surcharges; fees | Multi-jurisdiction tax depth beyond first market |
+| FX conversion + currency rounding | Mixed-cabin / complex routing fare construction |
+| Deterministic reprice + difference | Interline proration; negotiated-fare automation at scale |
+| Pooled tenant; INR / India POS | Bridged/siloed specifics; broad multi-currency POS |
+
+# 15. Testing Strategy
+
+- **Determinism / reproducibility. **The same inputs + fareDataVersion produce identical quotes across runs and nodes; golden-quote regression tests.
+
+- **Tax / GST correctness. **Tax outcomes checked against authoritative cases, including GST place-of-supply and per-segment vs per-ticket bases.
+
+- **Fare-rule application. **Qualification and disqualification (advance purchase, min/max stay, routing) and change/refund penalty computation.
+
+- **Reprice differences. **Add/cancel/exchange produce correct fareDifference + penalty and the right COLLECT/REFUND/EVEN action.
+
+- **Strategy swap. **FiledFareStrategy and a stubbed DynamicPricingStrategy are interchangeable behind the port with no pipeline change.
+
+- **Contract ****&**** load. **Consumer-driven contracts (Offer and Order are consumers); pricing throughput and latency under shopping peak.
+
+# 16. Open / Residual Decisions
+
+- In-house filed-fare data model and how external fare content (e.g. industry filed fares) is mapped in later.
+
+- Fare-rule category coverage for Phase 1 and the rule-evaluation approach (rules engine vs coded evaluators).
+
+- Quote validity window default and how Offer/Order handle expiry (re-quote vs hold price).
+
+- Currency rounding rules per currency and the FX rate source/refresh cadence.
+
+- Reprice penalty/residual model depth in Phase 1 (voluntary changes) vs later (involuntary/IROPS).
+
+- Phase-4 dynamic-pricing strategy contract and data dependencies (the port exists from day one).
+
+# 17. Appendix
+
+## 17.1 Glossary (delta)
+
+| **Term** | **Meaning** |
+| --- | --- |
+| Fare basis | The code identifying a fare and its conditions (e.g. BL1XIN). |
+| Fare market | The origin/destination (O&D) a fare applies to. |
+| Fare component | A priced portion of an itinerary mapped to one fare. |
+| Fare rule | Conditions governing a fare (advance purchase, stay, routing, penalties, etc.). |
+| YQ / YR | Carrier-imposed surcharges carried as separate amounts. |
+| PSF | Passenger service fee (an airport/government fee). |
+| Point of sale | The selling context: country, currency and channel. |
+| Residual value | The value already paid that carries over when an item is changed. |
+| Pricing strategy | The pluggable method of fare selection/base-fare computation (FILED │ DYNAMIC). |
+| fareDataVersion | The version of reference data a quote was computed against. |
+
+*This LLD is a working-draft companion to the SDD (v0.2), the Phase 0 **&** Phase 1 Build Plan, the Order and Inventory LLDs, and PSS_Landscape_Design_Roadmap_3.docx. Example payloads are illustrative; field-level schemas are defined in the module**'**s OpenAPI / event contracts.*
+
+	© 2026 Aurionpro Solutions Limited  ·  Confidential — internal working document	Page  of

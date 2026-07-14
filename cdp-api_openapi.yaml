@@ -1,0 +1,324 @@
+openapi: 3.0.3
+info:
+  title: PSS Personalisation / CDP Module API
+  version: "0.3.7"
+  description: >
+    Retro-documented contract for the Personalisation / Customer Data Platform (CDP)
+    module of the Aurionpro PSS platform (merged in PR #65, branch
+    feat/personalisation-cdp). This spec describes the endpoints as merged; it was
+    written after the code, not before — see CDP_DELTA_0_7_RETRO.md.
+
+    CDP owns the 360° customer profile, built exclusively from published events
+    (never module-store reads — enforced by tools/fitness/check_cdp_isolation.py),
+    and serves a consent-gated offer-ranking endpoint behind a pure RankingPort
+    (real ML deferred). It publishes no events and calls no module synchronously.
+
+    Conventions (carried from the platform):
+      * Tenant context is derived from the verified bearer token (tenant claim);
+        there is no tenant path/query parameter.
+      * Errors use the problem+json model (RFC 9457) with a stable code.
+    Deviations (see README_CDP_CONTRACTS.md): profile reads are gated by a
+    demo-posture X-Cdp-Admin header (app-level, not a filter); Idempotency-Key on
+    the consent POST is required but not honoured (natural-key upsert); consent
+    denial on rank-offers is NOT an error (returns a neutral 200 empty ranking).
+  contact:
+    name: Aurionpro Solutions Limited — PSS Platform
+    url: https://www.aurionpro.com
+
+servers:
+  - url: https://{host}
+    description: Gateway base URL (region-specific; India regions first)
+    variables:
+      host:
+        default: api.pss.local
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Consent
+    description: Consent capture and read (customer-facing).
+  - name: Profile
+    description: 360° customer profile reads (admin, demo posture).
+  - name: Ranking
+    description: Consent-gated offer ranking (PersonalisationPort surface, s2s).
+
+paths:
+
+  /v1/cdp/customers/{externalRef}/consent:
+    post:
+      tags: [Consent]
+      operationId: setConsent
+      summary: Record a consent decision
+      description: Upsert on the natural key (tenant + externalRef + consentType).
+      parameters:
+        - $ref: '#/components/parameters/ExternalRefPath'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ConsentRequest' }
+            examples:
+              optIn:
+                value: { consentType: PERSONALISATION, status: GIVEN }
+      responses:
+        '200':
+          description: The recorded consent.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConsentResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    get:
+      tags: [Consent]
+      operationId: getConsent
+      summary: List consent decisions for a customer
+      parameters:
+        - $ref: '#/components/parameters/ExternalRefPath'
+      responses:
+        '200':
+          description: Consent records (possibly empty; no 404).
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ConsentResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/cdp/customers/{externalRef}/profile:
+    get:
+      tags: [Profile]
+      operationId: getProfile
+      summary: Read a customer's 360° profile (admin)
+      parameters:
+        - $ref: '#/components/parameters/ExternalRefPath'
+        - $ref: '#/components/parameters/CdpAdminHeader'
+      responses:
+        '200':
+          description: The customer profile.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CustomerProfileResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/AdminRequired' }
+        '404':
+          description: No profile for this externalRef.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              examples:
+                notFound:
+                  value:
+                    type: https://errors.pss/aurionpro/cdp/not_found
+                    title: Profile not found
+                    status: 404
+                    code: PROFILE_NOT_FOUND
+
+  /v1/cdp/customers:
+    get:
+      tags: [Profile]
+      operationId: listProfiles
+      summary: Page through customer profiles (admin)
+      parameters:
+        - $ref: '#/components/parameters/CdpAdminHeader'
+        - name: page
+          in: query
+          required: false
+          schema: { type: integer, default: 0, minimum: 0 }
+        - name: size
+          in: query
+          required: false
+          schema: { type: integer, default: 20, minimum: 1 }
+      responses:
+        '200':
+          description: A page of customer profiles.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProfilesPageResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/AdminRequired' }
+
+  /v1/cdp/rank-offers:
+    post:
+      tags: [Ranking]
+      operationId: rankOffers
+      summary: Consent-gated offer ranking (PersonalisationPort surface)
+      description: >
+        Ranks the supplied offers for the customer. Consent-gated internally: if the customer has not
+        given PERSONALISATION consent, or has no profile, the ranking is neutral (this is NOT an error).
+        Called service-to-service by offer-service (wiring deferred — FLAG-007).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RankOffersRequest' }
+            examples:
+              rank:
+                value:
+                  externalRef: "pax-jdoe-001"
+                  offers:
+                    - { offerId: "OF1", origin: "BLR", destination: "BOM", cabin: "Y", totalAmount: 549900, currency: "INR" }
+      responses:
+        '200':
+          description: The ranked offers (order significant; neutral if consent/profile absent).
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/RankedOffer' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: OAuth2/OIDC bearer; the verified tenant claim is the tenant context.
+
+  parameters:
+    IdempotencyKeyHeader:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: "Client idempotency key. NOTE (deviation): required by the handler but not honoured (natural-key upsert)."
+      schema: { type: string, minLength: 1 }
+    CdpAdminHeader:
+      name: X-Cdp-Admin
+      in: header
+      required: false
+      description: >
+        Demo-posture admin gate (app-level, not a security filter). Must be literally true or the
+        request is rejected with 403 CDP_ADMIN_REQUIRED.
+      schema: { type: boolean }
+    ExternalRefPath:
+      name: externalRef
+      in: path
+      required: true
+      description: Tenant-scoped customer external reference.
+      schema: { type: string }
+
+  responses:
+    BadRequest:
+      description: Malformed request.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Unauthorized:
+      description: Missing or invalid bearer token.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    AdminRequired:
+      description: X-Cdp-Admin not present/true.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          examples:
+            adminRequired:
+              value:
+                type: https://errors.pss/aurionpro/cdp/forbidden
+                title: CDP admin required
+                status: 403
+                code: CDP_ADMIN_REQUIRED
+
+  schemas:
+    Problem:
+      type: object
+      description: RFC 9457 problem detail with a stable machine-readable code.
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        code:
+          type: string
+          enum: [PROFILE_NOT_FOUND, CDP_ADMIN_REQUIRED]
+      required: [status, code]
+
+    ConsentType:
+      type: string
+      enum: [PERSONALISATION, MARKETING, ANALYTICS]
+
+    ConsentStatus:
+      type: string
+      enum: [GIVEN, WITHDRAWN]
+
+    ConsentRequest:
+      type: object
+      required: [consentType, status]
+      properties:
+        consentType: { $ref: '#/components/schemas/ConsentType' }
+        status: { $ref: '#/components/schemas/ConsentStatus' }
+
+    ConsentResponse:
+      type: object
+      required: [externalRef, consentType, status, givenAt]
+      properties:
+        externalRef: { type: string }
+        consentType: { type: string, enum: [PERSONALISATION, MARKETING, ANALYTICS] }
+        status: { type: string, enum: [GIVEN, WITHDRAWN] }
+        givenAt: { type: string, format: date-time }
+        withdrawnAt: { type: string, format: date-time, nullable: true }
+
+    OfferSummary:
+      type: object
+      description: An offer candidate to rank. totalAmount is minor currency units.
+      required: [offerId, origin, destination, cabin, totalAmount, currency]
+      properties:
+        offerId: { type: string }
+        origin: { type: string }
+        destination: { type: string }
+        cabin: { type: string }
+        totalAmount: { type: integer, format: int64 }
+        currency: { type: string }
+
+    RankOffersRequest:
+      type: object
+      required: [externalRef, offers]
+      properties:
+        externalRef: { type: string, minLength: 1 }
+        offers:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/OfferSummary' }
+
+    RankedOffer:
+      type: object
+      required: [offerId, score, reason]
+      properties:
+        offerId: { type: string }
+        score: { type: number, format: double, description: "Ranking score (higher first)." }
+        reason: { type: string }
+
+    CustomerProfileResponse:
+      type: object
+      description: The 360° profile, event-sourced. Optional PII fields are null until seen in an event.
+      required: [externalRef, totalBookings, totalSpendMinorUnits, profileUpdatedAt]
+      properties:
+        externalRef: { type: string }
+        givenName: { type: string, nullable: true }
+        surname: { type: string, nullable: true }
+        email: { type: string, nullable: true }
+        totalBookings: { type: integer }
+        totalSpendMinorUnits: { type: integer, format: int64 }
+        loyaltyTier: { type: string, nullable: true }
+        preferredOrigin: { type: string, nullable: true }
+        preferredCabin: { type: string, nullable: true }
+        lastBookingAt: { type: string, format: date-time, nullable: true }
+        profileUpdatedAt: { type: string, format: date-time }
+
+    ProfilesPageResponse:
+      type: object
+      required: [content, page, size, totalElements, totalPages]
+      properties:
+        content:
+          type: array
+          items: { $ref: '#/components/schemas/CustomerProfileResponse' }
+        page: { type: integer }
+        size: { type: integer }
+        totalElements: { type: integer, format: int64 }
+        totalPages: { type: integer }

@@ -1,0 +1,314 @@
+PSS — Inventory / Availability LLD	Working Draft v0.1
+
+**PASSENGER SERVICE SYSTEM (PSS)**
+
+**Inventory / Availability Module — Low-Level Design**
+
+*Strongly-consistent holds · no oversell beyond policy · high-volume availability (CQRS)*
+
+Version 0.1 — Working Draft
+
+Prepared: June 2026
+
+Companion to: SDD (v0.2), Phase 0 & Phase 1 Build Plan, Order Module LLD, PSS_Landscape_Design_Roadmap_3.docx
+
+**Prepared by Aurionpro Solutions Limited**
+
+**Table of Contents**
+
+# 1. Introduction and Scope
+
+## 1.1 Purpose
+
+This is the low-level design (LLD) for the Inventory / Availability module. It is the second module specified in detail because it is the correctness-critical core of the booking path: it is what the Order module's book-pay-fulfil saga holds against, and the one place where overselling must be prevented. The document takes the Inventory summary from the System Design Document (SDD §5.2) down to buildable detail: the domain model, the hold lifecycle, the availability and oversell-prevention design, the API contract, the events, the interaction with the Order saga, and the persistence and consistency design.
+
+## 1.2 Relationship to companion documents
+
+This LLD conforms to the SDD (v0.2) and is sequenced by the Phase 0 & Phase 1 Build Plan (Inventory is part of the M4 'core data' milestone). It pairs directly with the Order Module LLD: the hold/confirm/release operations here are the counterpart to the saga steps there. Schedule & Flight and Fleet & Cabin Configuration supply the inputs (flights and capacity); Revenue Management supplies controls (allocations, overbooking) in later phases.
+
+## 1.3 Scope
+
+The full target model is specified; the Phase-1 subset (filed RBD-bucket inventory, holds with TTL, confirm/release, the availability read model, schedule/fleet-driven setup, a simple overbooking factor) is called out in Section 12. Dynamic/continuous availability, sophisticated RM nesting and authorisation-unit (AU) optimisation, O&D/segment control depth, and codeshare/interline inventory are designed for but deferred.
+
+## 1.4 Conventions
+
+API and field names are in monospace; example payloads are illustrative, not normative schemas. Identifiers are ULIDs. 'RBD' is the reservation booking designator (booking class); 'cabin' is the physical compartment (F/J/W/Y); 'AU' is an authorisation unit. Times are UTC (ISO-8601).
+
+# 2. Responsibilities and Boundaries
+
+## 2.1 What the Inventory module owns
+
+- The authoritative sellable counts per flight, cabin and booking class (RBD), including authorised capacity, sold and held.
+
+- Holds: time-boxed, idempotent reservations of inventory for an order, and their confirmation or release.
+
+- The availability calculation and the fast, high-volume availability read model used by shopping.
+
+- Enforcement of the no-oversell invariant within the configured overbooking policy.
+
+## 2.2 What the Inventory module does not own
+
+| **Concern** | **Owner** | **Inventory****'****s relationship** |
+| --- | --- | --- |
+| Flights, schedules, equipment assignment | Schedule & Flight | Consumes ScheduleChanged to create/adjust/close flight inventory. |
+| Physical cabin capacity & seat maps | Fleet & Cabin Configuration | Reads capacity to seed authorised capacity per cabin. |
+| Class allocations, overbooking / AU optimisation | Revenue Management (P2) | Consumes RM controls; applies them to buckets. |
+| The Order, payment and ticketing | Order / Payments / Ticketing | Serves holds to the Order saga; never creates orders itself. |
+| Physical seat assignment (which seat 12A) | Delivery / DCS | Inventory counts seats; DCS assigns specific seats at check-in. |
+
+## 2.3 Dependencies
+
+**Inbound (consumes): **ScheduleChanged, FleetConfigChanged, RevenueManagementControlsUpdated, OrderCancelled. **Outbound (called by / notifies): **called by Offer/Shopping (GetAvailability) and the Order saga (Hold/Confirm/Release); notifies all subscribers via AvailabilityChanged and the hold events.
+
+# 3. Domain Model
+
+## 3.1 Aggregates and entities
+
+There are two aggregates: FlightInventory (the counts) and Hold (a reservation). Keeping Hold separate from FlightInventory lets holds be created, expired and released at high volume without contending on the whole flight, while the authoritative counts remain the single source of truth.
+
+*Figure 1 — Inventory domain model. Authoritative counts live on the buckets; AvailabilityView is a derived read model.*
+
+FlightInventory (aggregate root):
+
+| **Field** | **Type / notes** |
+| --- | --- |
+| flightInventoryId | ULID, primary key. |
+| tenantId | Owning carrier; on every row; mandatory in every query. |
+| carrier / flightNumber / departureDate | Natural identity of the flight instance. |
+| boardPoint / offPoint | The leg (origin/destination) this inventory covers. |
+| scheduleRef / equipmentRef | References into Schedule and Fleet config (provenance of flight & capacity). |
+| status | OPEN │ SUSPENDED │ CLOSED (e.g. after departure). |
+| version | Optimistic-concurrency token. |
+
+CabinInventory and BookingClassBucket (the counts):
+
+| **Entity** | **Key fields** |
+| --- | --- |
+| CabinInventory | cabinInventoryId, flightInventoryId, cabin {F│J│W│Y}, physicalCapacity, authorizedCapacity, overbookingFactor, sold, held. |
+| BookingClassBucket | bucketId, cabinInventoryId, rbd, allocation, sold, held, available (derived). |
+
+Hold aggregate and the read model:
+
+| **Entity** | **Key fields** |
+| --- | --- |
+| Hold (root) | holdId, tenantId, orderId, state {HELD│CONFIRMED│RELEASED│EXPIRED}, expiresAt (TTL), idempotencyKey, version. |
+| HoldLine | holdLineId, holdId, bucketId, qty — one line per reserved bucket. |
+| AvailabilityView (read model) | flightInventoryId, cabin, rbd, available, updatedAt — denormalised for fast shopping reads. |
+
+## 3.2 The availability formula and the core invariant
+
+Availability is computed, not stored on the authoritative side; the read model caches the result. Using nested authorisation (a bucket cannot sell beyond its allocation, and a cabin cannot sell beyond its authorised capacity):
+
+| available(bucket) = min(     bucket.allocation        - bucket.sold        - bucket.held,     // class limit     cabin.authorizedCapacity - sum(cabin.sold)    - sum(cabin.held)  // cabin limit ) authorizedCapacity = round(physicalCapacity * (1 + overbookingFactor))                      // or set directly by Revenue Management (AU) INVARIANT (no oversell):  for every cabin,  sold + held <= authorizedCapacity                           for every bucket, sold + held <= allocation |
+| --- |
+
+The invariant is enforced transactionally on every hold and confirm (§5); a request that would breach it is rejected rather than partially applied.
+
+# 4. Hold Lifecycle State Machine
+
+A hold is the two-phase reservation the Order saga depends on: first HELD (phase one, reversible), then CONFIRMED into a sale (phase two) once payment settles — or released/expired if it does not.
+
+*Figure 2 — Hold lifecycle. Every transition adjusts authoritative counts atomically and emits an event.*
+
+| **From → To** | **Trigger** | **Effect** |
+| --- | --- | --- |
+| REQUESTED → HELD | HoldInventory succeeds (invariant holds) | Decrement available / increment held; set TTL; emit InventoryHeld + AvailabilityChanged. |
+| HELD → CONFIRMED | ConfirmHold (payment settled) | Move held → sold; emit InventoryConfirmed. |
+| HELD → RELEASED | ReleaseHold (saga compensation / cancel) | Increment available / decrement held; emit InventoryReleased + AvailabilityChanged. |
+| HELD → EXPIRED | Hold TTL elapses | Same count effect as release; emit InventoryReleased (reason=expired) + AvailabilityChanged. |
+| CONFIRMED → RELEASED | Order cancelled after confirmation | Move sold → available; emit InventoryReleased + AvailabilityChanged. |
+
+# 5. Availability and Oversell Prevention
+
+## 5.1 CQRS — separating reads from writes
+
+Shopping generates enormous read volume (high look-to-book ratios), while holds are comparatively rare but must be exactly correct. The module therefore splits the two paths: a strongly-consistent authoritative count store for holds/confirms/releases, and an eventually-consistent availability read model (cache) for shopping. A stale shopping read can never cause an oversell, because the authoritative check happens at hold time, not at read time.
+
+*Figure 3 — Read path (shopping, eventual) vs write path (holds, strongly consistent), reconciled by events.*
+
+## 5.2 Concurrency control
+
+Hold, ConfirmHold and ReleaseHold are serialised per (flightInventory, cabin) so concurrent bookings cannot both consume the last seat. The mechanism is an atomic conditional update against the authoritative counts, guarded by the cabin/bucket version: the operation re-reads the counts, checks the invariant, and commits the decrement only if it still holds — otherwise it retries or fails with a clear 'unavailable'. This guarantees no oversell beyond the configured policy even under heavy contention.
+
+## 5.3 Overbooking and Revenue Management controls
+
+Authorised capacity normally exceeds physical capacity by an overbooking factor to offset no-shows; in later phases Revenue Management sets authorisation units and class allocations directly, and the module simply applies them. Phase 1 uses a simple per-cabin overbooking factor; the controls interface is in place from the start so RM can be slotted in without changing the hold logic.
+
+## 5.4 Hold TTL and expiry
+
+Each hold carries a TTL (per-tenant configurable). A held reservation that is not confirmed within the TTL expires automatically, returning the inventory to the pool and emitting InventoryReleased + AvailabilityChanged. The hold TTL is coordinated with the Order saga's own timeout so the two never disagree about whether a hold is still live.
+
+# 6. API Contract
+
+Internal platform APIs over the gateway; REST/JSON; tenant from the verified token; state-changing calls require an Idempotency-Key. GetAvailability is read-optimised; the hold operations are strongly consistent.
+
+## 6.1 GetAvailability
+
+GET /v1/availability?origin=&destination=&date=&pax=&cabin=  — served from the read model; sub-second p95.
+
+| *Illustrative* GET /v1/availability?origin=BLR&destination=BOM&date=2026-07-15&pax=1&cabin=Y 200 OK { "flights": [    { "flightInventoryId":"01HZ...", "carrier":"XX","flightNumber":"123",      "depart":"2026-07-15T06:10:00+05:30",      "classes":[ {"rbd":"Y","available":9}, {"rbd":"B","available":4},                   {"rbd":"M","available":0} ] } ] } |
+| --- |
+
+## 6.2 HoldInventory
+
+POST /v1/holds  — reserve inventory for an order. Idempotent (Idempotency-Key + orderId). Strongly consistent.
+
+| *Illustrative* POST /v1/holds        Idempotency-Key: 9f1c...2a { "orderId":"01HZX...", "ttlSeconds":900,   "lines":[ {"flightInventoryId":"01HZ...","cabin":"Y","rbd":"B","qty":1} ] } 201 Created { "holdId":"01HK...", "state":"HELD", "expiresAt":"2026-07-01T10:15:00Z",   "lines":[ {"bucketId":"01HB...","qty":1} ] } // 422 if the invariant would be breached (inventory unavailable) |
+| --- |
+
+## 6.3 ConfirmHold / ReleaseHold
+
+POST /v1/holds/{holdId}/confirm  and  POST /v1/holds/{holdId}/release  — convert a hold to sold, or return it to the pool. Both idempotent by holdId; no-op if already in the target state.
+
+## 6.4 AdjustInventory
+
+POST /v1/inventory/{flightInventoryId}/adjust  — apply capacity, overbooking or allocation changes (from Schedule/Fleet/RM or operations). Emits AvailabilityChanged. Restricted by role.
+
+## 6.5 Error model
+
+| **HTTP** | **Condition** |
+| --- | --- |
+| 400 / 401 / 403 | Validation, authorisation or tenant-context failure. |
+| 404 Not Found | Flight inventory or hold not visible to the tenant. |
+| 409 Conflict | Stale version, or duplicate non-idempotent submission. |
+| 422 Unprocessable | Hold would breach the no-oversell invariant (inventory unavailable). |
+| 503 / Retry | Transient contention/failure; safe to retry with the same Idempotency-Key. |
+
+# 7. Domain Events
+
+Events share the platform envelope (eventId, type, version, tenantId, occurredAt, correlationId, causationId, payload) and are written via the transactional outbox; consumers are idempotent on eventId.
+
+## 7.1 Published
+
+| **Event** | **Emitted when** | **Key payload** |
+| --- | --- | --- |
+| InventoryHeld | A hold succeeds | holdId, orderId, lines[bucketId, qty], expiresAt |
+| InventoryConfirmed | A hold is confirmed (sold) | holdId, orderId, lines |
+| InventoryReleased | A hold is released or expires | holdId, orderId, reason {released│expired│cancelled} |
+| AvailabilityChanged | Any count change (hold/confirm/release/adjust) | flightInventoryId, cabin, affected RBDs + new available |
+| InventoryAdjusted | Capacity/allocation/overbooking changed | flightInventoryId, change summary |
+
+## 7.2 Consumed
+
+| **Event (source)** | **Effect** |
+| --- | --- |
+| ScheduleChanged (Schedule & Flight) | Create inventory for new flights; adjust on retime/equipment change; close on cancellation. |
+| FleetConfigChanged (Fleet & Cabin Config) | Update physical capacity / cabins; recompute authorised capacity. |
+| RevenueManagementControlsUpdated (RM, P2) | Apply class allocations, overbooking factors and AU. |
+| OrderCancelled (Order) | Release the associated hold or return sold inventory to the pool. |
+
+# 8. Interaction with the Book-Pay-Fulfil Saga
+
+Inventory provides the two-phase reservation the Order saga is built around. The saga calls HoldInventory at order creation (phase one), then — once payment settles — ConfirmHold (phase two); on any failure or timeout it calls ReleaseHold (compensation). Because holds are idempotent and TTL-bounded, the saga can safely retry, and an abandoned order's hold is reclaimed automatically even if no explicit release arrives.
+
+| **Saga step (Order LLD §7)** | **Inventory operation** | **Outcome** |
+| --- | --- | --- |
+| Create order → reserve | HoldInventory (TTL) | HELD; InventoryHeld emitted |
+| Payment settled → confirm | ConfirmHold | held → sold; InventoryConfirmed |
+| Payment failed / timeout | ReleaseHold (or TTL expiry) | inventory returned; InventoryReleased |
+| Order cancelled after confirm | ReleaseHold | sold → available; InventoryReleased |
+
+# 9. Persistence and Data Design
+
+## 9.1 Stores
+
+Two concerns, two stores. The authoritative counts use a strongly-consistent relational store (PostgreSQL-class); the availability read model uses a fast read/cache store updated from events. Inventory owns both; no other module reads these stores directly.
+
+| **Store / table** | **Holds** |
+| --- | --- |
+| flight_inventory | Flight-instance roots (carrier, flight, date, leg, refs, status, version). |
+| cabin_inventory | Per-cabin capacity and counts (physical, authorised, overbooking, sold, held). |
+| booking_class_bucket | Per-RBD allocation, sold, held. |
+| holds / hold_lines | Hold roots and their reserved bucket quantities (state, TTL, idempotencyKey). |
+| availability_view | Denormalised read model (flight, cabin, rbd, available) — the shopping cache. |
+| inventory_events_outbox | Domain events written in the same transaction as the count change. |
+
+## 9.2 Consistency and concurrency
+
+Count changes and their events are one transaction (outbox), giving exactly-once effects. Per-(flight, cabin) serialisation with atomic conditional updates enforces the no-oversell invariant. Holds are idempotent by idempotencyKey; confirm/release are idempotent by holdId. The read model is eventually consistent and rebuildable by replaying events.
+
+## 9.3 Multi-tenancy and scale
+
+Every row carries tenantId and is tenant-scoped by default (pooled tier). Data partitions by tenant and by flight (e.g. flightInventoryId / departureDate), so contention is naturally localised to a single flight-cabin and the system scales horizontally. The read model can be partitioned and cached per route/date for shopping throughput. Data residency follows the tenant (India region first).
+
+## 9.4 Expiry, audit and recovery
+
+Hold expiry is driven by TTL (a sweeper or time-indexed store) and is itself idempotent. Every count change is captured as an event (the audit trail) and mirrored to the platform audit log. Committed counts are protected by synchronous replication (RPO ≈ 0); the read model is reconstructable, so its loss is not data loss.
+
+# 10. Cross-Cutting Concerns
+
+- **Idempotency. **Holds keyed by idempotencyKey (+orderId); confirm/release idempotent by holdId; retries are always safe.
+
+- **Observability. **Traced operations (correlation/causation ids); business metrics — hold success/expiry/release rates, availability cache hit-rate and lag, oversell-guard rejections — with an SLO on GetAvailability latency.
+
+- **Configuration. **Per-tenant config: default hold TTL, overbooking factor defaults, cache freshness targets — all config-over-code.
+
+- **Security. **RBAC/ABAC; AdjustInventory restricted to RM/ops roles; reads scoped to the tenant.
+
+# 11. Non-Functional Targets (Inventory module)
+
+| **Dimension** | **Target (to ratify)** |
+| --- | --- |
+| **Availability latency** | GetAvailability p95 sub-second at high look-to-book ratios (served from the read model). |
+| **Hold latency** | HoldInventory / ConfirmHold within a tight, low-latency budget; strongly consistent. |
+| **Correctness** | No oversell beyond the configured overbooking policy under concurrency; idempotent operations. |
+| **Throughput ****&**** scale** | Read path scales with shopping volume; write path partitioned per flight; elastic consumers. |
+| **Availability (uptime)** | Critical-path tier (≥ 99.95%); shopping degrades gracefully to cached data if the write side is impaired. |
+| **Recoverability** | RPO ≈ 0 for committed counts; the read model is rebuildable from events. |
+
+# 12. Phase-1 Scope vs Full Design
+
+| **Built in Phase 1** | **Designed, deferred** |
+| --- | --- |
+| Filed RBD-bucket inventory per flight/cabin | Dynamic / continuous availability (P4) |
+| Holds with TTL; confirm; release | Sophisticated RM nesting & AU optimisation (P2) |
+| Availability read model + GetAvailability | Deep O&D / segment-level controls |
+| Schedule- and Fleet-driven setup | Codeshare / interline inventory (P2/P4) |
+| Simple per-cabin overbooking factor | Waitlist / standby; group inventory |
+| Pooled tenant; India region | Bridged/siloed tenant specifics |
+
+# 13. Testing Strategy
+
+- **Concurrency / oversell. **Many parallel holds against scarce inventory confirm the invariant holds — no oversell beyond policy — and surplus requests get a clean 422.
+
+- **Idempotency. **Replayed HoldInventory (same key) returns the same hold; repeated confirm/release are no-ops.
+
+- **TTL expiry. **Holds expire on schedule and return inventory; expiry is idempotent and emits the right events.
+
+- **Read-model consistency. **AvailabilityChanged events converge the read model; bounded staleness measured; rebuild-from-events verified.
+
+- **Contract tests. **Consumer-driven contracts for the APIs and every published/consumed event (Order is a key consumer).
+
+- **Load. **Shopping read throughput and hold write latency under peak and IROPS-surge profiles.
+
+# 14. Open / Residual Decisions
+
+- Concurrency mechanism for the authoritative counts: row-level locking vs optimistic compare-and-set vs single-writer-per-flight partition (actor).
+
+- Default hold TTL and the per-tenant override range, coordinated with the Order saga timeout.
+
+- Inventory control model depth in Phase 1: nested authorisation vs independent class allocations; when AU/RM controls land.
+
+- Read-model technology and acceptable staleness target for shopping.
+
+- Whether OrderCancelled drives release via event, or the Order saga always calls ReleaseHold explicitly (or both, for safety).
+
+- Handling of schedule changes/cancellations on flights with live holds and confirmed sales (re-accommodation hand-off to IROPS in P3).
+
+# 15. Appendix
+
+## 15.1 Glossary (delta)
+
+| **Term** | **Meaning** |
+| --- | --- |
+| RBD | Reservation booking designator — the booking class (e.g. Y, B, M). |
+| Cabin | Physical compartment (First/Business/Premium/Economy: F/J/W/Y). |
+| Authorised capacity | Sellable capacity for a cabin, typically physical capacity plus overbooking. |
+| AU (authorisation unit) | An RM-set sellable limit for a class or cabin. |
+| Hold | A time-boxed, idempotent reservation of inventory for an order (HELD → CONFIRMED/RELEASED/EXPIRED). |
+| Nested authorisation | A class cannot sell beyond its allocation, and the cabin cannot sell beyond its authorised capacity. |
+| CQRS | Separating a strongly-consistent write model from a fast, eventually-consistent read model. |
+
+*This LLD is a working-draft companion to the SDD (v0.2), the Phase 0 **&** Phase 1 Build Plan, the Order Module LLD, and PSS_Landscape_Design_Roadmap_3.docx. Example payloads are illustrative; field-level schemas are defined in the module**'**s OpenAPI / event contracts.*
+
+	© 2026 Aurionpro Solutions Limited  ·  Confidential — internal working document	Page  of

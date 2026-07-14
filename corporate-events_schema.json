@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.pss.aurionpro/corporate/events/v1",
+  "title": "Corporate domain events",
+  "description": "Published events from corporate-service via the transactional outbox (Kafka topic pss.corporate.events, message key = accountId). Consumers MUST be idempotent on eventId. This schema follows the ON-THE-WIRE envelope built in PolicyCompliantBookingService.publishBookingCreated: the JSON discriminator key is `type` (the DB column is event_type — the wire uses `type`), and `version` is the integer 1 (a deviation from the platform string \"1\"). Exactly ONE event type is emitted by the whole service.",
+  "$defs": {
+    "Ulid": {
+      "type": "string",
+      "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$",
+      "description": "ULID identifier."
+    },
+    "PolicyStatus": {
+      "type": "string",
+      "enum": ["COMPLIANT", "ADVISORY", "VIOLATION"],
+      "description": "Policy outcome stamped on the booking. On this event only COMPLIANT / ADVISORY appear (a VIOLATION blocks before a booking exists)."
+    },
+    "EventEnvelope": {
+      "type": "object",
+      "description": "Common envelope carried by every corporate domain event. NOTE: no accountId / memberId / correlationId at envelope level — accountId lives in the payload.",
+      "required": ["eventId", "type", "version", "tenantId", "occurredAt"],
+      "additionalProperties": false,
+      "properties": {
+        "eventId":    { "$ref": "#/$defs/Ulid", "description": "Unique event identifier; consumers deduplicate on this." },
+        "type":       { "type": "string", "description": "Discriminator constant. Wire JSON key is `type` (DB column is event_type)." },
+        "version":    { "type": "integer", "const": 1, "description": "Schema version. Integer 1 (NOT the string \"1\" other modules use)." },
+        "tenantId":   { "type": "string", "description": "Tenant that owns the account (from the verified token)." },
+        "occurredAt": { "type": "string", "format": "date-time", "description": "Instant.now(clock) at publish (ISO-8601)." },
+        "payload":    { "type": "object", "description": "Event-specific payload; discriminated by type." }
+      }
+    },
+    "CorporateBookingCreatedPayload": {
+      "type": "object",
+      "description": "Payload for CorporateBookingCreated events.",
+      "required": [
+        "bookingId",
+        "accountId",
+        "travellerId",
+        "costCentreCode",
+        "orderRef",
+        "totalAmount",
+        "currency",
+        "policyStatus",
+        "sellerRef"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "bookingId":      { "$ref": "#/$defs/Ulid", "description": "Corporate booking identifier." },
+        "accountId":      { "$ref": "#/$defs/Ulid", "description": "Corporate account identifier (also the Kafka message key)." },
+        "travellerId":    { "$ref": "#/$defs/Ulid", "description": "Traveller identifier." },
+        "costCentreCode": { "type": "string", "description": "Cost-centre business code tagged on the order." },
+        "orderRef":       { "type": "string", "description": "Pointer to the real order (order-service)." },
+        "totalAmount":    { "type": "number", "description": "Booking total (BigDecimal on the wire)." },
+        "currency":       { "type": "string", "description": "ISO-4217 currency code." },
+        "policyStatus":   { "$ref": "#/$defs/PolicyStatus", "description": "COMPLIANT or ADVISORY (VIOLATION never emitted)." },
+        "sellerRef":      { "type": "string", "pattern": "^CORP-[0-9A-HJKMNP-TV-Z]{26}-CC-.+$", "description": "CORP-{accountId}-CC-{costCentreCode}." }
+      }
+    }
+  },
+  "oneOf": [
+    {
+      "allOf": [
+        { "$ref": "#/$defs/EventEnvelope" },
+        {
+          "properties": {
+            "type":    { "const": "CorporateBookingCreated" },
+            "payload": { "$ref": "#/$defs/CorporateBookingCreatedPayload" }
+          },
+          "required": ["payload"]
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,471 @@
+openapi: 3.0.3
+info:
+  title: PSS Payments & Settlement Module API
+  version: "1.0.0-draft"
+  description: >
+    Payments API for the Payments & Settlement module of the Aurionpro PSS platform.
+    Payments is the money seam of book-pay-fulfil: it settles an order's amount through a
+    payment service provider (PSP) and refunds it on compensation. This contract realises
+    the operations in the Payments Module Low-Level Design (§5).
+
+    Conventions:
+      * Tenant context is derived from the verified bearer token (tenant claim); there is
+        no tenant path/query parameter. A request without tenant context is rejected.
+      * Every state-changing operation requires an Idempotency-Key header; a repeated key
+        returns the original result rather than acting twice. A replayed Pay settles once;
+        a replayed Refund returns the existing refund, never a second one.
+      * Errors use the problem+json model (RFC 9457).
+      * The platform never stores, logs or transmits a PAN. Instruments are PSP tokens only;
+        the cardholder-data environment is the PSP's, keeping the platform out of PCI scope.
+      * Money is an amount plus an ISO-4217 currency, exact decimal; the server enforces
+        currency precision.
+
+    Phase 1 (LLD §12): synchronous single-settle Pay, idempotent Refund with an honest
+    REFUND_FAILED state, and GetPaymentStatus for ambiguous-outcome resolution. Two-phase
+    authorise/capture is designed-for and deferred; the Capture operation is marked DEFERRED.
+
+    Provisional choices pending residual decisions (LLD §13): the deterministic refund-key
+    formula, default retry counts/backoff, and whether GetPaymentStatus reads last-known
+    state or polls the PSP live. These are marked PROVISIONAL.
+  contact:
+    name: Aurionpro Solutions Limited — PSS Platform
+    url: https://www.aurionpro.com
+
+servers:
+  - url: https://{host}
+    description: Gateway base URL (region-specific; India regions first)
+    variables:
+      host:
+        default: api.pss.local
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Payments
+    description: Settle, refund and query payments for an order.
+
+paths:
+  /v1/payments:
+    post:
+      tags: [Payments]
+      operationId: initiatePayment
+      summary: Settle a payment for an order (single-settle)
+      description: >
+        Single-settle a payment for an order: authorise and capture happen atomically at the
+        PSP. Called synchronously by the Order book-pay-fulfil saga after the inventory hold.
+        Returns the resulting PaymentIntent, SETTLED on success or FAILED on decline.
+        Idempotent per (orderId, Idempotency-Key): a replayed call returns the original
+        result and settles exactly once. Maps to LLD §5 InitiatePayment.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InitiatePaymentRequest'
+            examples:
+              upi-one-order:
+                summary: Settle an order total via UPI
+                value:
+                  orderId: 01HZX8N4S0ABCDEFGHJKMNPQRS
+                  amount: { amount: 5800.00, currency: INR }
+                  method: UPI
+                  instrumentToken: tok_01HZX8PSP9QWERTY
+      responses:
+        '201':
+          description: Payment settled; the PaymentIntent in SETTLED.
+          headers:
+            Location:
+              description: Canonical URL of the created payment intent.
+              schema: { type: string, format: uri }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentIntent'
+              examples:
+                settled:
+                  summary: Settled
+                  value:
+                    paymentIntentId: 01HZX8P0000000000000000PAY
+                    orderId: 01HZX8N4S0ABCDEFGHJKMNPQRS
+                    status: SETTLED
+                    amount: { amount: 5800.00, currency: INR }
+                    method: UPI
+                    pspReference: psp_txn_8842AA
+                    createdAt: "2026-07-01T10:15:02Z"
+                    updatedAt: "2026-07-01T10:15:03Z"
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '402':
+          description: >
+            Payment declined by the PSP (insufficient funds, instrument rejected). The
+            PaymentIntent is persisted in FAILED; the body is a problem+json detailing the
+            decline. The saga compensates the inventory hold.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /v1/payments/{paymentIntentId}:
+    parameters:
+      - $ref: '#/components/parameters/PaymentIntentIdPath'
+    get:
+      tags: [Payments]
+      operationId: getPaymentStatus
+      summary: Get the authoritative state of a payment
+      description: >
+        Return the current authoritative state of a payment intent. Used by the saga to
+        resolve an ambiguous Pay outcome: if a Pay call times out, the saga calls this
+        rather than assuming success or failure, so the system never charges without
+        booking nor books without charging. Maps to LLD §5 GetPaymentStatus and §6.4.
+      responses:
+        '200':
+          description: The payment intent.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentIntent'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/payments/{paymentIntentId}/refunds:
+    parameters:
+      - $ref: '#/components/parameters/PaymentIntentIdPath'
+    post:
+      tags: [Payments]
+      operationId: refundPayment
+      summary: Refund a settled payment
+      description: >
+        Refund a settled payment, in whole (Phase 1). Called synchronously by the saga as a
+        compensating action (confirm-hold failed, ticketing failed) or on a voluntary cancel.
+        Idempotent per the deterministic refund key (LLD §6.1): a replayed Refund returns the
+        existing refund, never issuing a second. On exhausted bounded retry the refund lands
+        in FAILED and the intent in REFUND_FAILED — money is still owed, an alert is raised,
+        and it awaits the drain (P2). Maps to LLD §5 Refund and §6.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefundRequest'
+            examples:
+              compensation:
+                summary: Refund on saga compensation
+                value:
+                  amount: { amount: 5800.00, currency: INR }
+                  reason: COMPENSATION
+      responses:
+        '201':
+          description: Refund issued; the Refund in ISSUED and the intent in REFUNDED.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refund'
+              examples:
+                issued:
+                  summary: Issued
+                  value:
+                    refundId: 01HZX8R0000000000000000REF
+                    paymentIntentId: 01HZX8P0000000000000000PAY
+                    status: ISSUED
+                    amount: { amount: 5800.00, currency: INR }
+                    reason: COMPENSATION
+                    pspRefundReference: psp_rfnd_5510BB
+                    occurredAt: "2026-07-01T10:16:40Z"
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: >
+            The intent is not in a refundable state (e.g. not SETTLED), or a conflicting
+            non-idempotent submission with a different key.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '422':
+          description: >
+            Refund could not be completed after bounded retries; the intent is REFUND_FAILED
+            and the refund FAILED. Money is still owed; the condition is alerting and awaits
+            the drain. The body is a problem+json.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /v1/payments/{paymentIntentId}/capture:
+    parameters:
+      - $ref: '#/components/parameters/PaymentIntentIdPath'
+    post:
+      tags: [Payments]
+      operationId: capturePayment
+      summary: Capture an authorised payment (DEFERRED — Phase 2)
+      description: >
+        DEFERRED (LLD §12). Two-phase capture of a previously authorised payment. The
+        operation and the AUTHORIZED/CAPTURED/VOIDED states are designed-for so that
+        two-phase slots in without remodelling; it is not implemented in Phase 1 and
+        returns 501 if called.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      responses:
+        '501':
+          description: Not implemented in Phase 1 (single-settle only).
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >
+        OAuth2/OIDC access token. The tenant is taken from a verified claim in the token;
+        there is no tenant path or query parameter. RBAC/ABAC is enforced per operation.
+
+  parameters:
+    PaymentIntentIdPath:
+      name: paymentIntentId
+      in: path
+      required: true
+      description: Internal payment intent identifier (ULID).
+      schema:
+        $ref: '#/components/schemas/Ulid'
+    IdempotencyKeyHeader:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Client-generated key making the operation safe to retry.
+      schema: { type: string, minLength: 8, maxLength: 64 }
+
+  responses:
+    BadRequest:
+      description: Validation failure (malformed payload, missing amount, bad currency).
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Unauthorized:
+      description: Missing or invalid authorisation / tenant context.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Forbidden:
+      description: Authenticated but not permitted for this operation or tenant.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    NotFound:
+      description: Payment intent not visible to the tenant.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Conflict:
+      description: Conflicting non-idempotent submission (duplicate with a different key).
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Unprocessable:
+      description: The request is well-formed but cannot be processed in the current state.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    ServiceUnavailable:
+      description: >
+        PSP unavailable or transient downstream failure; safe to retry with the same
+        Idempotency-Key.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+  schemas:
+    Ulid:
+      type: string
+      description: ULID identifier.
+      pattern: '^[0-9A-HJKMNP-TV-Z]{26}$'
+      example: 01HZX8N4S0ABCDEFGHJKMNPQRS
+    Currency:
+      type: string
+      description: ISO-4217 currency code.
+      pattern: '^[A-Z]{3}$'
+      example: INR
+    Money:
+      type: object
+      required: [amount, currency]
+      properties:
+        amount:
+          type: number
+          description: Decimal amount; server enforces currency precision. Never floating point on the server.
+          example: 5800.00
+        currency:
+          $ref: '#/components/schemas/Currency'
+
+    PaymentMethod:
+      type: string
+      description: India-first payment methods (LLD §12). PROVISIONAL method scope (LLD §13).
+      enum: [UPI, CARD, NET_BANKING, RUPAY]
+      example: UPI
+
+    PaymentStatus:
+      type: string
+      description: >
+        PaymentIntent lifecycle (LLD §3.2). Phase-1 live states: INITIATED, SETTLED, FAILED,
+        REFUND_PENDING, REFUNDED, REFUND_FAILED. AUTHORIZED, CAPTURED and VOIDED are
+        two-phase-ready and not exercised in Phase 1.
+      enum:
+        - INITIATED
+        - AUTHORIZED
+        - CAPTURED
+        - SETTLED
+        - FAILED
+        - REFUND_PENDING
+        - REFUNDED
+        - REFUND_FAILED
+        - VOIDED
+      example: SETTLED
+
+    TransactionType:
+      type: string
+      description: The PSP operation a Transaction records.
+      enum: [AUTHORIZE, CAPTURE, SETTLE]
+      example: SETTLE
+
+    RefundStatus:
+      type: string
+      enum: [PENDING, ISSUED, FAILED]
+      example: ISSUED
+
+    RefundReason:
+      type: string
+      description: Why a refund was raised. Drives the order-side compensation reason.
+      enum: [COMPENSATION, CANCELLED, EXPIRED, OTHER]
+      example: COMPENSATION
+
+    InitiatePaymentRequest:
+      type: object
+      required: [orderId, amount, method]
+      properties:
+        orderId:
+          $ref: '#/components/schemas/Ulid'
+        amount:
+          $ref: '#/components/schemas/Money'
+        method:
+          $ref: '#/components/schemas/PaymentMethod'
+        instrumentToken:
+          type: string
+          description: >
+            PSP token for the instrument. The platform never receives a PAN; tokenisation
+            happens at the PSP. Optional for methods that redirect (e.g. UPI collect).
+          example: tok_01HZX8PSP9QWERTY
+      additionalProperties: false
+
+    RefundRequest:
+      type: object
+      required: [amount, reason]
+      properties:
+        amount:
+          $ref: '#/components/schemas/Money'
+        reason:
+          $ref: '#/components/schemas/RefundReason'
+      additionalProperties: false
+
+    Transaction:
+      type: object
+      description: A single PSP operation against a PaymentIntent (the audit trail).
+      required: [transactionId, type, outcome, occurredAt]
+      properties:
+        transactionId:
+          $ref: '#/components/schemas/Ulid'
+        type:
+          $ref: '#/components/schemas/TransactionType'
+        outcome:
+          type: string
+          enum: [SUCCESS, DECLINED, ERROR]
+        amount:
+          $ref: '#/components/schemas/Money'
+        pspRequestRef:
+          type: string
+          nullable: true
+        pspResponseRef:
+          type: string
+          nullable: true
+        occurredAt:
+          type: string
+          format: date-time
+
+    Refund:
+      type: object
+      required: [refundId, paymentIntentId, status, amount, reason, occurredAt]
+      properties:
+        refundId:
+          $ref: '#/components/schemas/Ulid'
+        paymentIntentId:
+          $ref: '#/components/schemas/Ulid'
+        status:
+          $ref: '#/components/schemas/RefundStatus'
+        amount:
+          $ref: '#/components/schemas/Money'
+        reason:
+          $ref: '#/components/schemas/RefundReason'
+        pspRefundReference:
+          type: string
+          nullable: true
+          description: The PSP's refund identifier; the reconciliation hook (LLD §6.3).
+        occurredAt:
+          type: string
+          format: date-time
+
+    PaymentIntent:
+      type: object
+      description: The authoritative record of an order's payment attempt (LLD §3).
+      required: [paymentIntentId, orderId, status, amount, createdAt, updatedAt]
+      properties:
+        paymentIntentId:
+          $ref: '#/components/schemas/Ulid'
+        orderId:
+          $ref: '#/components/schemas/Ulid'
+        status:
+          $ref: '#/components/schemas/PaymentStatus'
+        amount:
+          $ref: '#/components/schemas/Money'
+        method:
+          $ref: '#/components/schemas/PaymentMethod'
+        pspReference:
+          type: string
+          nullable: true
+          description: The PSP's transaction identifier; the reconciliation hook (LLD §3.1, §6.3).
+        transactions:
+          type: array
+          items: { $ref: '#/components/schemas/Transaction' }
+        refunds:
+          type: array
+          items: { $ref: '#/components/schemas/Refund' }
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    Problem:
+      type: object
+      description: RFC 9457 problem+json error.
+      properties:
+        type: { type: string, format: uri, example: "about:blank" }
+        title: { type: string, example: "Payment declined" }
+        status: { type: integer, example: 402 }
+        detail: { type: string, example: "The PSP declined the instrument." }
+        instance: { type: string, format: uri }
+        code:
+          type: string
+          description: Stable machine-readable error code.
+          example: PAYMENT_DECLINED
+      required: [title, status]

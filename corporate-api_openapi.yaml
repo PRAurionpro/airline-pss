@@ -1,0 +1,901 @@
+openapi: 3.0.3
+info:
+  title: PSS Corporate / SME Module API
+  version: "0.3.2-corporate-thin"
+  description: >
+    Corporate / SME travel-management API for the Aurionpro PSS platform. This
+    contract documents corporate-service AS MERGED (build plan §C0–C3, Corporate
+    Delta 0.3): corporate account onboarding, cost-centre / traveller / travel-policy
+    directory, the PolicyCompliantBooking self-booking flow, and the consolidated
+    billing-statement stub.
+
+    Conventions actually in force (verified against the controllers):
+      * Tenant context is derived from the verified bearer token (tenant claim via
+        TenantContextHolder.requireTenantId()); there is NO tenant path/query/header.
+      * The admin surfaces (accounts, cost-centres, travellers, policies) are gated by
+        a demo `X-Corporate-Admin: true` header (delta §5 — full RBAC is later). The
+        booking and statement surfaces are NOT gated (bearer only).
+      * There is NO inbound Idempotency-Key on any corporate endpoint.
+      * Errors are a plain `{ status, code, detail }` JSON body (application/json) —
+        NOT RFC-9457 problem+json. See the Error schema and the Deviations section of
+        README_CORPORATE_CONTRACTS.md.
+      * Money fields are BigDecimal on the wire (modelled as JSON number). Identifiers
+        are ULIDs unless noted.
+  contact:
+    name: Aurionpro Solutions Limited — PSS Platform
+    url: https://www.aurionpro.com
+
+servers:
+  - url: http://localhost:8085
+    description: corporate-service (local dev; server.port = 8085)
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Accounts
+    description: Corporate account onboarding (admin-gated). CorporateController.
+  - name: Cost Centres
+    description: Cost-centre directory under an account (admin-gated). CostCentreController.
+  - name: Travellers
+    description: Traveller directory under an account (admin-gated). TravellerController.
+  - name: Policies
+    description: Travel-policy directory under an account (admin-gated). TravelPolicyController.
+  - name: Bookings
+    description: PolicyCompliantBooking self-booking surface (bearer only). BookingController.
+  - name: Statements
+    description: Consolidated billing statements (bearer only). BillingStatementController.
+
+paths:
+
+  # ── Accounts (CorporateController) ──────────────────────────────────────────
+
+  /v1/corporate/accounts:
+    post:
+      tags: [Accounts]
+      operationId: registerAccount
+      summary: Register a corporate account
+      description: >
+        Onboards a corporate / SME account at ACTIVE status, version 0. Admin-gated.
+        Returns 201 CREATED with an `ETag: "<version>"` response header (no If-Match
+        is ever consumed).
+      parameters:
+        - $ref: '#/components/parameters/CorporateAdminHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterAccountRequest'
+            examples:
+              demo-account:
+                summary: Demo account registration
+                value:
+                  companyName: "Contoso Travel Pvt Ltd"
+                  registrationNo: "U74999KA2020PTC000000"
+                  billingEmail: "ap@contoso.example"
+                  contactName: "Priya Rao"
+      responses:
+        '201':
+          description: Account registered (ACTIVE, version 0). Carries an ETag header.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountResponse'
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '403': { $ref: '#/components/responses/AdminRequired' }
+        '409': { $ref: '#/components/responses/DuplicateAccount' }
+
+  /v1/corporate/accounts/{accountId}:
+    get:
+      tags: [Accounts]
+      operationId: getAccount
+      summary: Read a corporate account
+      description: Admin-gated. Returns 200 with an ETag response header (the account version).
+      parameters:
+        - $ref: '#/components/parameters/CorporateAdminHeader'
+        - $ref: '#/components/parameters/AccountIdPath'
+      responses:
+        '200':
+          description: Account found. Carries an ETag header.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountResponse'
+        '403': { $ref: '#/components/responses/AdminRequired' }
+        '404': { $ref: '#/components/responses/AccountNotFound' }
+
+  # ── Cost Centres (CostCentreController) ─────────────────────────────────────
+
+  /v1/corporate/accounts/{accountId}/cost-centres:
+    post:
+      tags: [Cost Centres]
+      operationId: createCostCentre
+      summary: Create a cost centre under an account
+      description: Admin-gated, (tenant, account)-scoped. Returns 201 CREATED.
+      parameters:
+        - $ref: '#/components/parameters/CorporateAdminHeader'
+        - $ref: '#/components/parameters/AccountIdPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateCostCentreRequest'
+            examples:
+              demo-cost-centre:
+                summary: Demo cost centre
+                value:
+                  code: "ENG"
+                  name: "Engineering"
+                  budgetLimit: 500000.00
+      responses:
+        '201':
+          description: Cost centre created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CostCentreResponse'
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '403': { $ref: '#/components/responses/AdminRequired' }
+        '404': { $ref: '#/components/responses/AccountNotFound' }
+    get:
+      tags: [Cost Centres]
+      operationId: listCostCentres
+      summary: List cost centres under an account
+      description: >
+        Admin-gated. Returns a BARE JSON array (not a wrapper object) of cost centres.
+      parameters:
+        - $ref: '#/components/parameters/CorporateAdminHeader'
+        - $ref: '#/components/parameters/AccountIdPath'
+      responses:
+        '200':
+          description: Cost centres for the account (bare array).
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/CostCentreResponse'
+        '403': { $ref: '#/components/responses/AdminRequired' }
+        '404': { $ref: '#/components/responses/AccountNotFound' }
+
+  /v1/corporate/accounts/{accountId}/cost-centres/{costCentreId}:
+    get:
+      tags: [Cost Centres]
+      operationId: getCostCentre
+      summary: Read a cost centre
+      description: Admin-gated, (tenant, account)-scoped.
+      parameters:
+        - $ref: '#/components/parameters/CorporateAdminHeader'
+        - $ref: '#/components/parameters/AccountIdPath'
+        - $ref: '#/components/parameters/CostCentreIdPath'
+      responses:
+        '200':
+          description: Cost centre found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CostCentreResponse'
+        '403': { $ref: '#/components/responses/AdminRequired' }
+        '404': { $ref: '#/components/responses/AccountOrCostCentreNotFound' }
+
+  # ── Travellers (TravellerController) ────────────────────────────────────────
+
+  /v1/corporate/accounts/{accountId}/travellers:
+    post:
+      tags: [Travellers]
+      operationId: registerTraveller
+      summary: Register a traveller under an account
+      description: >
+        Admin-gated, (tenant, account)-scoped. `email` is validated `@NotBlank` only
+        (NOT `@Email`) — any non-blank string is accepted.
+      parameters:
+        - $ref: '#/components/parameters/CorporateAdminHeader'
+        - $ref: '#/components/parameters/AccountIdPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterTravellerRequest'
+            examples:
+              demo-traveller:
+                summary: Demo traveller
+                value:
+                  employeeId: "E-10231"
+                  givenName: "Arjun"
+                  surname: "Mehta"
+                  email: "arjun.mehta@contoso.example"
+                  costCentreId: "01HZX8N4S0CCENTREABCDEFGHJ"
+      responses:
+        '201':
+          description: Traveller registered.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TravellerResponse'
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '403': { $ref: '#/components/responses/AdminRequired' }
+        '404': { $ref: '#/components/responses/AccountNotFound' }
+
+  /v1/corporate/accounts/{accountId}/travellers/{travellerId}:
+    get:
+      tags: [Travellers]
+      operationId: getTraveller
+      summary: Read a traveller
+      description: Admin-gated, (tenant, account)-scoped.
+      parameters:
+        - $ref: '#/components/parameters/CorporateAdminHeader'
+        - $ref: '#/components/parameters/AccountIdPath'
+        - $ref: '#/components/parameters/TravellerIdPath'
+      responses:
+        '200':
+          description: Traveller found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TravellerResponse'
+        '403': { $ref: '#/components/responses/AdminRequired' }
+        '404': { $ref: '#/components/responses/AccountOrTravellerNotFound' }
+
+  # ── Policies (TravelPolicyController) ───────────────────────────────────────
+
+  /v1/corporate/accounts/{accountId}/policies:
+    post:
+      tags: [Policies]
+      operationId: createPolicy
+      summary: Create a travel policy (supersedes prior active)
+      description: >
+        Admin-gated, (tenant, account)-scoped. Creating a policy supersedes the prior
+        active policy for the account. Returns 201 CREATED.
+      parameters:
+        - $ref: '#/components/parameters/CorporateAdminHeader'
+        - $ref: '#/components/parameters/AccountIdPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreatePolicyRequest'
+            examples:
+              demo-policy:
+                summary: Demo policy
+                value:
+                  name: "Domestic economy under 15k"
+                  maxFareAmount: 15000.00
+                  cabinClass: "ECONOMY"
+                  advanceBookingDays: 7
+                  requiresApproval: false
+      responses:
+        '201':
+          description: Policy created and made active.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TravelPolicyResponse'
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '403': { $ref: '#/components/responses/AdminRequired' }
+        '404': { $ref: '#/components/responses/AccountNotFound' }
+
+  /v1/corporate/accounts/{accountId}/policies/active:
+    get:
+      tags: [Policies]
+      operationId: getActivePolicy
+      summary: Read the active travel policy
+      description: >
+        Admin-gated. Returns the single active policy or `NO_ACTIVE_POLICY` (404).
+      parameters:
+        - $ref: '#/components/parameters/CorporateAdminHeader'
+        - $ref: '#/components/parameters/AccountIdPath'
+      responses:
+        '200':
+          description: Active policy.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TravelPolicyResponse'
+        '403': { $ref: '#/components/responses/AdminRequired' }
+        '404': { $ref: '#/components/responses/AccountOrNoActivePolicy' }
+
+  # ── Bookings (BookingController) — NOT admin-gated ──────────────────────────
+
+  /v1/corporate/bookings:
+    post:
+      tags: [Bookings]
+      operationId: createBooking
+      summary: Create a policy-compliant booking
+      description: >
+        The PolicyCompliantBooking main flow. NOT admin-gated (traveller self-booking;
+        tenant from token). NOTE: returns **200 OK**, not 201 — there is no
+        ResponseEntity, no Location, no ETag on booking creation. A hard policy breach
+        blocks the booking with `POLICY_VIOLATION` (409); only COMPLIANT / ADVISORY
+        bookings are stored. A `departureDate` that fails to parse surfaces as
+        `OFFER_NOT_AVAILABLE` (422), NOT a 400.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateBookingRequest'
+            examples:
+              demo-booking:
+                summary: Demo booking
+                value:
+                  accountId: "01HZX8N4S0ACCOUNTABCDEFGHJ"
+                  travellerId: "01HZX8N4S0TRAVELLERABCDEFG"
+                  costCentreId: "01HZX8N4S0CCENTREABCDEFGHJ"
+                  itinerary:
+                    origin: "BLR"
+                    destination: "DEL"
+                    departureDate: "2026-08-15"
+                  cabinClass: "ECONOMY"
+                  passengerCount: 1
+      responses:
+        '200':
+          description: Booking created (COMPLIANT or ADVISORY). NOTE 200, not 201.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BookingCreatedResponse'
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '403': { $ref: '#/components/responses/AccountSuspended' }
+        '404': { $ref: '#/components/responses/BookingPreconditionNotFound' }
+        '409': { $ref: '#/components/responses/PolicyViolation' }
+        '422': { $ref: '#/components/responses/OfferNotAvailable' }
+
+  /v1/corporate/bookings/{bookingId}:
+    get:
+      tags: [Bookings]
+      operationId: getBooking
+      summary: Read a booking
+      description: NOT admin-gated; tenant from token. `warnings` is always empty on a stored booking.
+      parameters:
+        - $ref: '#/components/parameters/BookingIdPath'
+      responses:
+        '200':
+          description: Booking detail.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BookingDetailResponse'
+        '404': { $ref: '#/components/responses/BookingNotFound' }
+
+  /v1/corporate/accounts/{accountId}/bookings:
+    get:
+      tags: [Bookings]
+      operationId: listBookings
+      summary: List bookings for an account
+      description: NOT admin-gated. Returns a BARE JSON array (newest first).
+      parameters:
+        - $ref: '#/components/parameters/AccountIdPath'
+      responses:
+        '200':
+          description: Bookings for the account (bare array).
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/BookingDetailResponse'
+        '404': { $ref: '#/components/responses/AccountNotFound' }
+
+  # ── Statements (BillingStatementController) — NOT admin-gated ───────────────
+
+  /v1/corporate/accounts/{accountId}/statements:
+    get:
+      tags: [Statements]
+      operationId: listStatements
+      summary: List billing statements for an account
+      description: >
+        NOT admin-gated; tenant from token. Lazily generates a current-month OPEN stub.
+        Returns a WRAPPER object `{ statements: [...] }` (unlike the bare-array list
+        endpoints elsewhere in this service).
+      parameters:
+        - $ref: '#/components/parameters/AccountIdPath'
+      responses:
+        '200':
+          description: Statements for the account (wrapped).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatementListResponse'
+        '404': { $ref: '#/components/responses/AccountNotFound' }
+
+  /v1/corporate/accounts/{accountId}/statements/{statementId}:
+    get:
+      tags: [Statements]
+      operationId: getStatement
+      summary: Read a billing statement with its booking lines
+      description: NOT admin-gated; tenant from token.
+      parameters:
+        - $ref: '#/components/parameters/AccountIdPath'
+        - $ref: '#/components/parameters/StatementIdPath'
+      responses:
+        '200':
+          description: Statement detail with booking lines.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatementDetailResponse'
+        '404': { $ref: '#/components/responses/StatementNotFound' }
+
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >
+        OAuth2/OIDC access token. The tenant is taken from a verified claim in the
+        token (claim `tenantId`, fallback `tid`); there is no tenant path/query/header.
+        The account/cost-centre/traveller/policy admin operations additionally require
+        the demo `X-Corporate-Admin: true` header (full RBAC in a later slice); the
+        booking and statement operations require only the bearer.
+
+  headers:
+    ETag:
+      description: >
+        The account's optimistic-concurrency version as a plain (quoted) ETag, e.g.
+        `"0"`. Emitted on account create/get only. No `If-Match` is ever consumed and
+        there is no account update endpoint, so this value is read-only on the wire.
+      schema:
+        type: string
+      example: '"0"'
+
+  parameters:
+    CorporateAdminHeader:
+      name: X-Corporate-Admin
+      in: header
+      required: false
+      description: >
+        Demo corporate-admin assertion. Must equal `true` (case-insensitive) or the
+        request is rejected with `CORPORATE_ADMIN_REQUIRED` (403). Applied only to the
+        admin surfaces (accounts, cost-centres, travellers, policies).
+      schema:
+        type: string
+    AccountIdPath:
+      name: accountId
+      in: path
+      required: true
+      description: Corporate account identifier (ULID).
+      schema:
+        $ref: '#/components/schemas/Ulid'
+    CostCentreIdPath:
+      name: costCentreId
+      in: path
+      required: true
+      description: Cost-centre identifier (ULID).
+      schema:
+        $ref: '#/components/schemas/Ulid'
+    TravellerIdPath:
+      name: travellerId
+      in: path
+      required: true
+      description: Traveller identifier (ULID).
+      schema:
+        $ref: '#/components/schemas/Ulid'
+    BookingIdPath:
+      name: bookingId
+      in: path
+      required: true
+      description: Booking identifier (ULID).
+      schema:
+        $ref: '#/components/schemas/Ulid'
+    StatementIdPath:
+      name: statementId
+      in: path
+      required: true
+      description: Statement identifier (ULID).
+      schema:
+        $ref: '#/components/schemas/Ulid'
+
+  responses:
+    InvalidRequest:
+      description: Bean-validation failure (@NotBlank / @Valid). code INVALID_REQUEST.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          examples:
+            invalid:
+              value: { status: 400, code: INVALID_REQUEST, detail: "companyName: must not be blank" }
+    AdminRequired:
+      description: Missing or non-`true` X-Corporate-Admin header. code CORPORATE_ADMIN_REQUIRED.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          examples:
+            admin:
+              value: { status: 403, code: CORPORATE_ADMIN_REQUIRED, detail: "X-Corporate-Admin: true header required for corporate admin APIs" }
+    DuplicateAccount:
+      description: An account with this identity already exists for the tenant. code DUPLICATE_ACCOUNT.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          examples:
+            duplicate:
+              value: { status: 409, code: DUPLICATE_ACCOUNT, detail: "Corporate account already exists" }
+    AccountNotFound:
+      description: Account not visible to the tenant. code ACCOUNT_NOT_FOUND.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          examples:
+            not-found:
+              value: { status: 404, code: ACCOUNT_NOT_FOUND, detail: "Corporate account not found" }
+    AccountOrCostCentreNotFound:
+      description: Account or cost centre not found. code ACCOUNT_NOT_FOUND or COST_CENTRE_NOT_FOUND.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          examples:
+            account:
+              value: { status: 404, code: ACCOUNT_NOT_FOUND, detail: "Corporate account not found" }
+            cost-centre:
+              value: { status: 404, code: COST_CENTRE_NOT_FOUND, detail: "Cost centre not found" }
+    AccountOrTravellerNotFound:
+      description: Account or traveller not found. code ACCOUNT_NOT_FOUND or TRAVELLER_NOT_FOUND.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          examples:
+            account:
+              value: { status: 404, code: ACCOUNT_NOT_FOUND, detail: "Corporate account not found" }
+            traveller:
+              value: { status: 404, code: TRAVELLER_NOT_FOUND, detail: "Traveller not found" }
+    AccountOrNoActivePolicy:
+      description: Account not found, or no active policy exists. code ACCOUNT_NOT_FOUND or NO_ACTIVE_POLICY.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          examples:
+            account:
+              value: { status: 404, code: ACCOUNT_NOT_FOUND, detail: "Corporate account not found" }
+            no-policy:
+              value: { status: 404, code: NO_ACTIVE_POLICY, detail: "No active policy for account" }
+    AccountSuspended:
+      description: The account is not ACTIVE; booking blocked. code ACCOUNT_SUSPENDED.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          examples:
+            suspended:
+              value: { status: 403, code: ACCOUNT_SUSPENDED, detail: "Corporate account is suspended" }
+    BookingPreconditionNotFound:
+      description: >
+        A booking precondition entity is missing. code ACCOUNT_NOT_FOUND,
+        TRAVELLER_NOT_FOUND, COST_CENTRE_NOT_FOUND, or NO_ACTIVE_POLICY.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          examples:
+            account:
+              value: { status: 404, code: ACCOUNT_NOT_FOUND, detail: "Corporate account not found" }
+            traveller:
+              value: { status: 404, code: TRAVELLER_NOT_FOUND, detail: "Traveller not found" }
+            cost-centre:
+              value: { status: 404, code: COST_CENTRE_NOT_FOUND, detail: "Cost centre not found" }
+            no-policy:
+              value: { status: 404, code: NO_ACTIVE_POLICY, detail: "No active policy for account" }
+    PolicyViolation:
+      description: Hard policy breach; booking blocked. code POLICY_VIOLATION.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          examples:
+            violation:
+              value: { status: 409, code: POLICY_VIOLATION, detail: "Fare exceeds policy maximum" }
+    OfferNotAvailable:
+      description: >
+        No offer / no session, or an unparseable departureDate. code OFFER_NOT_AVAILABLE.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          examples:
+            no-offer:
+              value: { status: 422, code: OFFER_NOT_AVAILABLE, detail: "No offer available" }
+            bad-date:
+              value: { status: 422, code: OFFER_NOT_AVAILABLE, detail: "Invalid departureDate 'not-a-date'" }
+    BookingNotFound:
+      description: Booking not visible to the tenant. code BOOKING_NOT_FOUND.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          examples:
+            not-found:
+              value: { status: 404, code: BOOKING_NOT_FOUND, detail: "Booking not found" }
+    StatementNotFound:
+      description: Statement not visible to the tenant. code STATEMENT_NOT_FOUND (ACCOUNT_NOT_FOUND also possible via scoping).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          examples:
+            not-found:
+              value: { status: 404, code: STATEMENT_NOT_FOUND, detail: "Statement not found" }
+
+  schemas:
+
+    Ulid:
+      type: string
+      description: ULID identifier.
+      pattern: '^[0-9A-HJKMNP-TV-Z]{26}$'
+      example: 01HZX8N4S0ABCDEFGHJKMNPQRS
+
+    Error:
+      type: object
+      description: >
+        Corporate error body. This is the ACTUAL wire shape — a plain
+        `{ status, code, detail }` object served as `application/json` (NOT RFC-9457
+        problem+json; there is no `type` / `title` / `instance`).
+      required: [status, code]
+      properties:
+        status: { type: integer, description: "HTTP status, mirrored in the body.", example: 404 }
+        code:   { type: string, description: Stable machine-readable error code., example: ACCOUNT_NOT_FOUND }
+        detail: { type: string, nullable: true, description: Human-readable detail (the exception message). }
+
+    CorporateStatus:
+      type: string
+      enum: [ACTIVE, SUSPENDED]
+      description: Corporate account lifecycle.
+
+    CabinClass:
+      type: string
+      enum: [ECONOMY, BUSINESS, ANY]
+      description: Cabin class. On a policy, ANY = unrestricted; on a booking, the cabin selected.
+
+    PolicyStatus:
+      type: string
+      enum: [COMPLIANT, ADVISORY, VIOLATION]
+      description: >
+        Policy outcome stamped on a booking. VIOLATION never appears on a stored
+        booking or the create response (a hard breach blocks with POLICY_VIOLATION).
+
+    BillingStatus:
+      type: string
+      enum: [OPEN, CLOSED, SETTLED]
+      description: Billing statement lifecycle. The C3 stub generates OPEN.
+
+    RegisterAccountRequest:
+      type: object
+      description: >
+        RegisterAccount body. `billingEmail` is validated `@NotBlank` only (NOT
+        `@Email`) — any non-blank string is accepted.
+      required: [companyName, billingEmail, contactName]
+      properties:
+        companyName:    { type: string, minLength: 1 }
+        registrationNo: { type: string, nullable: true }
+        billingEmail:   { type: string, minLength: 1, description: "Not @Email-validated — non-blank string only." }
+        contactName:    { type: string, minLength: 1 }
+
+    AccountResponse:
+      type: object
+      description: >
+        Account wire shape. `tenantId` and `registrationNo` are intentionally NOT on
+        the wire.
+      required: [accountId, companyName, status, billingEmail, contactName, version, createdAt]
+      properties:
+        accountId:    { $ref: '#/components/schemas/Ulid' }
+        companyName:  { type: string }
+        status:       { $ref: '#/components/schemas/CorporateStatus' }
+        billingEmail: { type: string }
+        contactName:  { type: string }
+        version:      { type: integer, description: Optimistic-concurrency version; starts at 0., example: 0 }
+        createdAt:    { type: string, format: date-time }
+
+    CreateCostCentreRequest:
+      type: object
+      required: [code, name]
+      properties:
+        code:        { type: string, minLength: 1 }
+        name:        { type: string, minLength: 1 }
+        budgetLimit: { type: number, nullable: true, description: "Informational in this slice (no enforcement)." }
+
+    CostCentreResponse:
+      type: object
+      required: [costCentreId, accountId, code, name, active]
+      properties:
+        costCentreId: { $ref: '#/components/schemas/Ulid' }
+        accountId:    { $ref: '#/components/schemas/Ulid' }
+        code:         { type: string }
+        name:         { type: string }
+        budgetLimit:  { type: number, nullable: true }
+        active:       { type: boolean }
+
+    RegisterTravellerRequest:
+      type: object
+      description: "`email` is @NotBlank only (NOT @Email)."
+      required: [employeeId, givenName, surname, email]
+      properties:
+        employeeId:   { type: string, minLength: 1 }
+        givenName:    { type: string, minLength: 1 }
+        surname:      { type: string, minLength: 1 }
+        email:        { type: string, minLength: 1, description: "Not @Email-validated — non-blank string only." }
+        costCentreId: { type: string, nullable: true }
+
+    TravellerResponse:
+      type: object
+      required: [travellerId, accountId, employeeId, givenName, surname, email]
+      properties:
+        travellerId:  { $ref: '#/components/schemas/Ulid' }
+        accountId:    { $ref: '#/components/schemas/Ulid' }
+        employeeId:   { type: string }
+        givenName:    { type: string }
+        surname:      { type: string }
+        email:        { type: string }
+        costCentreId: { type: string, nullable: true }
+
+    CreatePolicyRequest:
+      type: object
+      required: [name, maxFareAmount, cabinClass]
+      properties:
+        name:               { type: string, minLength: 1 }
+        maxFareAmount:      { type: number }
+        cabinClass:         { $ref: '#/components/schemas/CabinClass' }
+        advanceBookingDays: { type: integer, nullable: true, description: "No advance-booking rule when null." }
+        requiresApproval:   { type: boolean, default: false }
+
+    TravelPolicyResponse:
+      type: object
+      required: [policyId, accountId, name, maxFareAmount, cabinClass, requiresApproval, active]
+      properties:
+        policyId:           { $ref: '#/components/schemas/Ulid' }
+        accountId:          { $ref: '#/components/schemas/Ulid' }
+        name:               { type: string }
+        maxFareAmount:      { type: number }
+        cabinClass:         { $ref: '#/components/schemas/CabinClass' }
+        advanceBookingDays: { type: integer, nullable: true }
+        requiresApproval:   { type: boolean }
+        active:             { type: boolean }
+
+    ItineraryRequest:
+      type: object
+      description: "`departureDate` is a free string parsed to LocalDate server-side; a bad value → OFFER_NOT_AVAILABLE (422)."
+      required: [origin, destination, departureDate]
+      properties:
+        origin:        { type: string, minLength: 1 }
+        destination:   { type: string, minLength: 1 }
+        departureDate: { type: string, description: "Free string parsed as LocalDate (e.g. 2026-08-15)." }
+
+    CreateBookingRequest:
+      type: object
+      required: [accountId, travellerId, costCentreId, itinerary, cabinClass]
+      properties:
+        accountId:      { type: string, minLength: 1 }
+        travellerId:    { type: string, minLength: 1 }
+        costCentreId:   { type: string, minLength: 1 }
+        itinerary:      { $ref: '#/components/schemas/ItineraryRequest' }
+        cabinClass:     { $ref: '#/components/schemas/CabinClass' }
+        passengerCount: { type: integer, default: 1 }
+
+    WarningDto:
+      type: object
+      required: [rule, message]
+      properties:
+        rule:    { type: string }
+        message: { type: string }
+
+    BookingCreatedResponse:
+      type: object
+      description: >
+        POST /bookings response (HTTP 200). `policyStatus` is COMPLIANT or ADVISORY
+        (VIOLATION never returned — it blocks).
+      required: [bookingId, orderRef, policyStatus, costCentreCode, totalAmount, currency, warnings]
+      properties:
+        bookingId:      { $ref: '#/components/schemas/Ulid' }
+        orderRef:       { type: string }
+        policyStatus:   { $ref: '#/components/schemas/PolicyStatus' }
+        costCentreCode: { type: string }
+        totalAmount:    { type: number }
+        currency:       { type: string }
+        warnings:
+          type: array
+          items:
+            $ref: '#/components/schemas/WarningDto'
+
+    BookingDetailResponse:
+      type: object
+      description: >
+        GetBooking / ListBookings shape. `costCentreCode` is derived from `sellerRef`
+        (substring after `-CC-`). `warnings` is always empty for a stored booking
+        (not persisted).
+      required:
+        - bookingId
+        - accountId
+        - travellerId
+        - costCentreId
+        - costCentreCode
+        - policyId
+        - orderRef
+        - offerId
+        - totalAmount
+        - currency
+        - cabinClass
+        - advanceBookingDays
+        - policyStatus
+        - sellerRef
+        - createdAt
+        - warnings
+      properties:
+        bookingId:          { $ref: '#/components/schemas/Ulid' }
+        accountId:          { $ref: '#/components/schemas/Ulid' }
+        travellerId:        { $ref: '#/components/schemas/Ulid' }
+        costCentreId:       { $ref: '#/components/schemas/Ulid' }
+        costCentreCode:     { type: string, description: "Derived from sellerRef.substringAfter('-CC-')." }
+        policyId:           { $ref: '#/components/schemas/Ulid' }
+        orderRef:           { type: string }
+        offerId:            { type: string }
+        totalAmount:        { type: number }
+        currency:           { type: string }
+        cabinClass:         { $ref: '#/components/schemas/CabinClass' }
+        advanceBookingDays: { type: integer }
+        policyStatus:       { $ref: '#/components/schemas/PolicyStatus' }
+        sellerRef:          { type: string, description: "CORP-{accountId}-CC-{costCentreCode}." }
+        createdAt:          { type: string, format: date-time }
+        warnings:
+          type: array
+          description: Always empty for a stored booking.
+          items:
+            $ref: '#/components/schemas/WarningDto'
+
+    StatementResponse:
+      type: object
+      required: [statementId, accountId, periodStart, periodEnd, totalAmount, currency, status, bookingCount, generatedAt]
+      properties:
+        statementId:  { $ref: '#/components/schemas/Ulid' }
+        accountId:    { $ref: '#/components/schemas/Ulid' }
+        periodStart:  { type: string, format: date }
+        periodEnd:    { type: string, format: date }
+        totalAmount:  { type: number }
+        currency:     { type: string }
+        status:       { $ref: '#/components/schemas/BillingStatus' }
+        bookingCount: { type: integer }
+        generatedAt:  { type: string, format: date-time }
+
+    StatementListResponse:
+      type: object
+      description: Wrapper object (NOT a bare array) — listStatements returns a statements array wrapped in this object.
+      required: [statements]
+      properties:
+        statements:
+          type: array
+          items:
+            $ref: '#/components/schemas/StatementResponse'
+
+    BillingBookingLine:
+      type: object
+      description: A booking line within a statement period.
+      required: [bookingId, travellerId, costCentreId, orderRef, totalAmount, currency, policyStatus, createdAt]
+      properties:
+        bookingId:    { $ref: '#/components/schemas/Ulid' }
+        travellerId:  { $ref: '#/components/schemas/Ulid' }
+        costCentreId: { $ref: '#/components/schemas/Ulid' }
+        orderRef:     { type: string }
+        totalAmount:  { type: number }
+        currency:     { type: string }
+        policyStatus: { $ref: '#/components/schemas/PolicyStatus' }
+        createdAt:    { type: string, format: date-time }
+
+    StatementDetailResponse:
+      type: object
+      required: [statementId, accountId, periodStart, periodEnd, totalAmount, currency, status, bookingCount, generatedAt, bookings]
+      properties:
+        statementId:  { $ref: '#/components/schemas/Ulid' }
+        accountId:    { $ref: '#/components/schemas/Ulid' }
+        periodStart:  { type: string, format: date }
+        periodEnd:    { type: string, format: date }
+        totalAmount:  { type: number }
+        currency:     { type: string }
+        status:       { $ref: '#/components/schemas/BillingStatus' }
+        bookingCount: { type: integer }
+        generatedAt:  { type: string, format: date-time }
+        bookings:
+          type: array
+          items:
+            $ref: '#/components/schemas/BillingBookingLine'

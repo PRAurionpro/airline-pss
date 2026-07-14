@@ -1,0 +1,570 @@
+openapi: 3.0.3
+info:
+  title: PSS Loyalty / FFP Module API
+  version: "0.1.0-draft"
+  description: >
+    Frequent-flyer / loyalty API for the Aurionpro PSS platform. This contract
+    realises the Loyalty module as specified in LOYALTY_DELTA_0_3_EARN_REDEEM.md
+    (§7 API) and the System Design Document (§5 module catalogue).
+
+    This tranche is the thin walking-skeleton slice: enrol a member, earn miles
+    automatically from the Order event stream, recognise tier, and redeem miles
+    for a loyalty-owned award voucher. Real "pay with miles" (Pricing/Payments
+    application) is stubbed behind a port in this slice; the API surface here is
+    the member-, ledger- and redemption-facing design.
+
+    Conventions (carried from the platform):
+      * Tenant context is derived from the verified bearer token (tenant claim);
+        there is no tenant path/query parameter.
+      * Every state-changing operation requires an Idempotency-Key header;
+        a repeated key returns the original result rather than acting twice.
+      * Errors use the problem+json model (RFC 9457) with a stable code.
+      * Identifiers are ULIDs unless noted.
+
+    Architecture posture (LOYALTY_DELTA §2):
+      Loyalty is a downstream side-ledger + event consumer. Accrual reacts to
+      OrderConfirmed / OrderCancelled on the existing backbone; it never calls
+      Order, Pricing, Offer or Payments write paths. The points ledger is
+      append-only; balance and tier are projections over it.
+  contact:
+    name: Aurionpro Solutions Limited — PSS Platform
+    url: https://www.aurionpro.com
+
+servers:
+  - url: https://{host}
+    description: Gateway base URL (region-specific; India regions first)
+    variables:
+      host:
+        default: api.pss.local
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Members
+    description: Enrolment, member + account summary, balance, ledger history, statement.
+  - name: Earning
+    description: Manual / admin accrual seam (the event consumer is the production path).
+  - name: Redemption
+    description: Redemption catalogue and award redemption.
+
+paths:
+
+  # ── Members ────────────────────────────────────────────────────────────────
+
+  /v1/loyalty/members:
+    post:
+      tags: [Members]
+      operationId: enrolMember
+      summary: Enrol a frequent-flyer member
+      description: >
+        Enrols a member and opens a LoyaltyAccount at zero balance, BASE tier.
+        Idempotent on externalRef within a tenant — a repeated externalRef
+        returns DUPLICATE_ENROLMENT. L0 gate operation.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EnrolRequest'
+            examples:
+              demo-member:
+                summary: Demo member enrolment
+                value:
+                  externalRef: "pax-jdoe-001"
+                  givenName: "Jamie"
+                  surname: "Doe"
+                  email: "jamie.doe@example.com"
+      responses:
+        '201':
+          description: Member enrolled; account opened at zero balance, BASE tier.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemberSummary'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: A member with this externalRef already exists for the tenant.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              examples:
+                duplicate:
+                  value:
+                    type: https://errors.pss/aurionpro/loyalty/conflict
+                    title: Member already enrolled
+                    status: 409
+                    code: DUPLICATE_ENROLMENT
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /v1/loyalty/members/{memberId}:
+    get:
+      tags: [Members]
+      operationId: getMember
+      summary: Read member + account summary
+      parameters:
+        - $ref: '#/components/parameters/MemberIdPath'
+      responses:
+        '200':
+          description: Member + account summary.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemberSummary'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/loyalty/members/{memberId}/balance:
+    get:
+      tags: [Members]
+      operationId: getBalance
+      summary: Read points balance, qualifying miles and current tier
+      parameters:
+        - $ref: '#/components/parameters/MemberIdPath'
+      responses:
+        '200':
+          description: Balance view (projection over the ledger).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BalanceView'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/loyalty/members/{memberId}/transactions:
+    get:
+      tags: [Members]
+      operationId: getTransactions
+      summary: Read the points ledger history
+      description: >
+        Returns the append-only ledger for the member's account, newest first:
+        accruals, reversals, redemptions and adjustments.
+      parameters:
+        - $ref: '#/components/parameters/MemberIdPath'
+      responses:
+        '200':
+          description: Ledger history.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/PointsTransaction'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/loyalty/members/{memberId}/statement:
+    get:
+      tags: [Members]
+      operationId: getStatement
+      summary: Read a period statement (opening → accruals → redemptions → closing)
+      parameters:
+        - $ref: '#/components/parameters/MemberIdPath'
+      responses:
+        '200':
+          description: Period statement.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Statement'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ── Earning (admin / test seam) ────────────────────────────────────────────
+
+  /v1/loyalty/members/{memberId}/earn:
+    post:
+      tags: [Earning]
+      operationId: manualEarn
+      summary: Explicit accrual (admin / test seam)
+      description: >
+        Appends an ACCRUAL ledger entry directly, bypassing the event consumer.
+        Exists so the ledger, earn-rule and tier engines can be exercised before
+        the OrderConfirmed consumer lands (L1 gate). Requires X-Loyalty-Admin.
+        In production, accrual flows from OrderConfirmed, not this endpoint.
+      parameters:
+        - $ref: '#/components/parameters/MemberIdPath'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+        - $ref: '#/components/parameters/LoyaltyAdminHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ManualEarnRequest'
+            examples:
+              demo-earn:
+                summary: Earn from a base fare
+                value:
+                  sourceRef: "ORD-7K3M9P"
+                  basisAmount: 5200.00
+                  currency: "INR"
+      responses:
+        '201':
+          description: ACCRUAL appended; balance and tier recomputed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PointsTransaction'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422':
+          description: No active earn rule, or member suspended.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              examples:
+                no-rule:
+                  value:
+                    type: https://errors.pss/aurionpro/loyalty/unprocessable
+                    title: No active earn rule
+                    status: 422
+                    code: NO_ACTIVE_EARN_RULE
+
+  # ── Redemption ─────────────────────────────────────────────────────────────
+
+  /v1/loyalty/redemption-options:
+    get:
+      tags: [Redemption]
+      operationId: listRedemptionOptions
+      summary: List the active redemption catalogue
+      responses:
+        '200':
+          description: Active redemption options.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/RedemptionOption'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v1/loyalty/members/{memberId}/redemptions:
+    post:
+      tags: [Redemption]
+      operationId: redeem
+      summary: Redeem points for an award (debit → voucher)
+      description: >
+        Debits points and issues an award voucher via RedemptionFulfilmentPort
+        (stub in this slice). Checks balance first — INSUFFICIENT_POINTS leaves
+        the ledger untouched. Idempotent on Idempotency-Key. L3 gate operation.
+      parameters:
+        - $ref: '#/components/parameters/MemberIdPath'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RedeemRequest'
+            examples:
+              redeem-voucher:
+                summary: Redeem an award voucher
+                value:
+                  optionId: "01HZX8N4S0OPTABCDEFGHJKMNP"
+      responses:
+        '201':
+          description: Points debited; award redemption issued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AwardRedemption'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422':
+          description: Insufficient points, unknown redemption option, or member suspended.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              examples:
+                insufficient:
+                  value:
+                    type: https://errors.pss/aurionpro/loyalty/unprocessable
+                    title: Insufficient points
+                    status: 422
+                    code: INSUFFICIENT_POINTS
+                option-not-found:
+                  value:
+                    type: https://errors.pss/aurionpro/loyalty/unprocessable
+                    title: Redemption option not found
+                    status: 422
+                    code: REDEMPTION_OPTION_NOT_FOUND
+
+  /v1/loyalty/redemptions/{redemptionId}:
+    get:
+      tags: [Redemption]
+      operationId: getRedemption
+      summary: Read an award redemption + voucher reference
+      parameters:
+        - $ref: '#/components/parameters/RedemptionIdPath'
+      responses:
+        '200':
+          description: Award redemption detail.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AwardRedemption'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >
+        OAuth2/OIDC access token. The tenant is taken from a verified claim in
+        the token; there is no tenant path or query parameter. Admin operations
+        (ManualEarn) additionally require the X-Loyalty-Admin header (demo
+        posture — full RBAC in a later slice).
+
+  parameters:
+    MemberIdPath:
+      name: memberId
+      in: path
+      required: true
+      description: Member identifier (ULID).
+      schema:
+        $ref: '#/components/schemas/Ulid'
+    RedemptionIdPath:
+      name: redemptionId
+      in: path
+      required: true
+      description: Redemption identifier (ULID).
+      schema:
+        $ref: '#/components/schemas/Ulid'
+    IdempotencyKeyHeader:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Client-generated key making the operation safe to retry.
+      schema: { type: string, minLength: 8, maxLength: 64 }
+    LoyaltyAdminHeader:
+      name: X-Loyalty-Admin
+      in: header
+      required: true
+      description: Demo-posture admin assertion for the manual earn seam.
+      schema: { type: boolean }
+
+  responses:
+    BadRequest:
+      description: Malformed payload or missing required field.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Unauthorized:
+      description: Missing or invalid authorisation / tenant context.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Forbidden:
+      description: Authenticated but not permitted for this operation or tenant.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    NotFound:
+      description: Member or redemption not visible to the tenant.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    ServiceUnavailable:
+      description: Transient downstream failure; safe to retry with the same Idempotency-Key.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+  schemas:
+
+    Ulid:
+      type: string
+      description: ULID identifier.
+      pattern: '^[0-9A-HJKMNP-TV-Z]{26}$'
+      example: 01HZX8N4S0ABCDEFGHJKMNPQRS
+
+    Currency:
+      type: string
+      description: ISO-4217 currency code.
+      pattern: '^[A-Z]{3}$'
+      example: INR
+
+    Money:
+      type: object
+      required: [amount, currency]
+      additionalProperties: false
+      properties:
+        amount:   { type: number }
+        currency: { $ref: '#/components/schemas/Currency' }
+
+    Problem:
+      type: object
+      description: RFC 9457 problem detail.
+      required: [type, title, status]
+      properties:
+        type:     { type: string, format: uri, example: 'https://errors.pss/aurionpro/loyalty/unprocessable' }
+        title:    { type: string, example: Insufficient points }
+        status:   { type: integer, example: 422 }
+        detail:   { type: string, example: Balance 1200 is below the option cost 5000. }
+        instance: { type: string, format: uri }
+        code:     { type: string, description: Stable machine-readable error code., example: INSUFFICIENT_POINTS }
+
+    Tier:
+      type: string
+      enum: [BASE, SILVER, GOLD]
+      description: Recognised tier, derived from cumulative qualifying miles.
+
+    PointsTransactionType:
+      type: string
+      enum: [ACCRUAL, REVERSAL, REDEMPTION, ADJUSTMENT]
+
+    TransactionSourceType:
+      type: string
+      enum: [ORDER_EVENT, MANUAL, REDEMPTION]
+
+    EarnBasis:
+      type: string
+      enum: [BASE_FARE, TOTAL]
+      description: Which order amount the earn rule applies to.
+
+    RedemptionOptionKind:
+      type: string
+      enum: [AWARD_VOUCHER, ANCILLARY_AWARD]
+
+    RedemptionStatus:
+      type: string
+      enum: [ISSUED, FULFILLED, VOID]
+
+    MemberStatus:
+      type: string
+      enum: [ACTIVE, SUSPENDED]
+
+    MemberSummary:
+      type: object
+      description: Member identity plus a summary of their loyalty account.
+      required: [memberId, tenantId, status, enrolledAt, account]
+      properties:
+        memberId:   { $ref: '#/components/schemas/Ulid' }
+        tenantId:   { type: string }
+        externalRef: { type: string, nullable: true, description: "Caller-supplied reference (e.g. pax ref / email)." }
+        givenName:  { type: string }
+        surname:    { type: string }
+        email:      { type: string, format: email, nullable: true }
+        status:     { $ref: '#/components/schemas/MemberStatus' }
+        enrolledAt: { type: string, format: date-time }
+        account:    { $ref: '#/components/schemas/BalanceView' }
+
+    BalanceView:
+      type: object
+      description: Projection over the points ledger.
+      required: [accountId, pointsBalance, qualifyingMiles, currentTier]
+      properties:
+        accountId:       { $ref: '#/components/schemas/Ulid' }
+        pointsBalance:   { type: integer, minimum: 0, example: 5200 }
+        qualifyingMiles: { type: integer, minimum: 0, example: 5200 }
+        currentTier:     { $ref: '#/components/schemas/Tier' }
+
+    PointsTransaction:
+      type: object
+      description: A single append-only ledger entry.
+      required: [txnId, accountId, type, points, sourceType, occurredAt]
+      properties:
+        txnId:           { $ref: '#/components/schemas/Ulid' }
+        accountId:       { $ref: '#/components/schemas/Ulid' }
+        type:            { $ref: '#/components/schemas/PointsTransactionType' }
+        points:          { type: integer, description: "Signed; negative for REVERSAL / REDEMPTION.", example: 520 }
+        qualifyingMiles: { type: integer, nullable: true, example: 520 }
+        sourceType:      { $ref: '#/components/schemas/TransactionSourceType' }
+        sourceRef:       { type: string, nullable: true, description: "orderId / eventId / redemptionId, by sourceType." }
+        occurredAt:      { type: string, format: date-time }
+
+    RedemptionOption:
+      type: object
+      required: [optionId, tenantId, name, pointsCost, kind, active]
+      properties:
+        optionId:   { $ref: '#/components/schemas/Ulid' }
+        tenantId:   { type: string }
+        name:       { type: string, example: "Domestic award voucher" }
+        pointsCost: { type: integer, minimum: 1, example: 5000 }
+        kind:       { $ref: '#/components/schemas/RedemptionOptionKind' }
+        active:     { type: boolean }
+
+    AwardRedemption:
+      type: object
+      required: [redemptionId, accountId, optionId, pointsDebited, voucherRef, status, createdAt]
+      properties:
+        redemptionId:  { $ref: '#/components/schemas/Ulid' }
+        accountId:     { $ref: '#/components/schemas/Ulid' }
+        optionId:      { $ref: '#/components/schemas/Ulid' }
+        pointsDebited: { type: integer, minimum: 1, example: 5000 }
+        voucherRef:    { type: string, example: "AWD-7K3M9P" }
+        fulfilmentRef: { type: string, nullable: true, description: "Reference returned by RedemptionFulfilmentPort (stub in this slice)." }
+        status:        { $ref: '#/components/schemas/RedemptionStatus' }
+        createdAt:     { type: string, format: date-time }
+
+    StatementLine:
+      type: object
+      required: [txnId, type, points, occurredAt]
+      properties:
+        txnId:      { $ref: '#/components/schemas/Ulid' }
+        type:       { $ref: '#/components/schemas/PointsTransactionType' }
+        points:     { type: integer }
+        sourceRef:  { type: string, nullable: true }
+        occurredAt: { type: string, format: date-time }
+
+    Statement:
+      type: object
+      description: Period statement aggregated from the ledger.
+      required: [accountId, periodStart, periodEnd, openingBalance, closingBalance, lines]
+      properties:
+        accountId:      { $ref: '#/components/schemas/Ulid' }
+        periodStart:    { type: string, format: date-time }
+        periodEnd:      { type: string, format: date-time }
+        openingBalance: { type: integer, minimum: 0 }
+        closingBalance: { type: integer, minimum: 0 }
+        totalAccrued:   { type: integer, minimum: 0 }
+        totalRedeemed:  { type: integer, minimum: 0 }
+        lines:
+          type: array
+          items:
+            $ref: '#/components/schemas/StatementLine'
+
+    EnrolRequest:
+      type: object
+      required: [givenName, surname]
+      additionalProperties: false
+      properties:
+        externalRef: { type: string, description: "Caller reference (pax ref / email). Enrolment is idempotent on this within a tenant." }
+        givenName:   { type: string }
+        surname:     { type: string }
+        email:       { type: string, format: email }
+
+    ManualEarnRequest:
+      type: object
+      required: [basisAmount, currency]
+      additionalProperties: false
+      properties:
+        sourceRef:   { type: string, description: "Reference recorded on the ledger entry (e.g. order ref)." }
+        basisAmount: { type: number, minimum: 0, description: "Amount the earn rule applies to (per EarnBasis)." }
+        currency:    { $ref: '#/components/schemas/Currency' }
+
+    RedeemRequest:
+      type: object
+      required: [optionId]
+      additionalProperties: false
+      properties:
+        optionId: { $ref: '#/components/schemas/Ulid' }

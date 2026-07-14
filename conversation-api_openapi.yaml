@@ -1,0 +1,242 @@
+openapi: 3.0.3
+info:
+  title: PSS Conversational Commerce Module API
+  version: "0.3.5"
+  description: >
+    Retro-documented contract for the Conversational Commerce (WhatsApp) module of
+    the Aurionpro PSS platform (merged in PR #62, branch feat/conversational-commerce).
+    This spec describes the endpoints as merged; it was written after the code, not
+    before — see CONVERSATION_DELTA_0_5_RETRO.md.
+
+    A thin channel adapter: it receives inbound WhatsApp messages via a webhook,
+    drives a per-customer session state machine, and calls the SAME public
+    order-service and dcs-service APIs the IBE uses (read-back + check-in). It owns
+    conversation session state only; WhatsApp I/O is behind a stub gateway port. It
+    publishes no backbone events (outbound WhatsApp is not a backbone event).
+
+    Conventions & deviations (see README_CONVERSATION_CONTRACTS.md):
+      * Admin read endpoints derive tenant from the verified bearer token (tenant
+        claim) and are gated by a demo-posture X-Conversation-Admin header.
+      * The webhook is PUBLIC (no bearer, no signature verification this slice) and
+        resolves tenant from the request body — a deliberate deviation for the stub
+        Meta integration.
+      * Errors use the problem+json model (RFC 9457) with a stable code.
+  contact:
+    name: Aurionpro Solutions Limited — PSS Platform
+    url: https://www.aurionpro.com
+
+servers:
+  - url: https://{host}
+    description: Gateway base URL (region-specific; India regions first)
+    variables:
+      host:
+        default: api.pss.local
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Webhook
+    description: Inbound WhatsApp webhook (public, stub shape).
+  - name: Admin
+    description: Session and outbound-notification reads (demo-posture admin).
+
+paths:
+
+  /v1/conversation/webhook:
+    post:
+      tags: [Webhook]
+      operationId: inboundWebhook
+      summary: Inbound WhatsApp message (stub shape)
+      description: >
+        Drives the session state machine and ACKs 200 immediately (WhatsApp webhook convention).
+        PUBLIC — no bearer token and no signature verification in this slice. Tenant comes from the
+        request body (deviation). The payload is a stub, NOT the real Meta envelope.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WebhookRequest' }
+            examples:
+              inbound:
+                value: { tenantId: "acme-air", from: "+919000000001", body: "PNR ABC123" }
+      responses:
+        '200':
+          description: Acknowledged.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WebhookAck' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /v1/conversation/sessions:
+    get:
+      tags: [Admin]
+      operationId: listSessions
+      summary: Active sessions for the tenant (admin)
+      parameters:
+        - $ref: '#/components/parameters/ConversationAdminHeader'
+      responses:
+        '200':
+          description: Sessions, newest activity first.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/SessionResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/AdminRequired' }
+
+  /v1/conversation/sessions/{id}:
+    get:
+      tags: [Admin]
+      operationId: getSession
+      summary: Session detail + state (admin)
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/ConversationAdminHeader'
+      responses:
+        '200':
+          description: The session.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SessionResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/AdminRequired' }
+        '404':
+          description: Session id not visible to the tenant.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              examples:
+                notFound:
+                  value:
+                    type: https://errors.pss/aurionpro/conversation/not_found
+                    title: Session not found
+                    status: 404
+                    code: SESSION_NOT_FOUND
+
+  /v1/conversation/notifications:
+    get:
+      tags: [Admin]
+      operationId: listNotifications
+      summary: Outbound notification log (admin)
+      parameters:
+        - $ref: '#/components/parameters/ConversationAdminHeader'
+      responses:
+        '200':
+          description: Outbound notifications, newest first.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/NotificationResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/AdminRequired' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: OAuth2/OIDC bearer; the verified tenant claim is the tenant context (admin endpoints only).
+
+  parameters:
+    ConversationAdminHeader:
+      name: X-Conversation-Admin
+      in: header
+      required: false
+      description: >
+        Demo-posture admin gate (app-level, not a security filter). Must be literally true or the
+        request is rejected with 403 CONVERSATION_ADMIN_REQUIRED.
+      schema: { type: boolean }
+
+  responses:
+    BadRequest:
+      description: Malformed request (e.g. blank webhook fields).
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Unauthorized:
+      description: Missing or invalid bearer token.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    AdminRequired:
+      description: X-Conversation-Admin not present/true.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          examples:
+            adminRequired:
+              value:
+                type: https://errors.pss/aurionpro/conversation/forbidden
+                title: Conversation admin required
+                status: 403
+                code: CONVERSATION_ADMIN_REQUIRED
+
+  schemas:
+    Problem:
+      type: object
+      description: RFC 9457 problem detail with a stable machine-readable code.
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        code:
+          type: string
+          enum: [SESSION_NOT_FOUND, CONVERSATION_ADMIN_REQUIRED]
+      required: [status, code]
+
+    ConversationState:
+      type: string
+      description: Session state machine. AWAITING_NAME is declared but not currently reached.
+      enum: [IDLE, AWAITING_PNR, AWAITING_NAME, BOOKING_CONFIRMED, CHECKIN_SENT]
+
+    NotificationStatus:
+      type: string
+      enum: [PENDING, SENT, FAILED]
+
+    WebhookRequest:
+      type: object
+      description: Stub inbound shape (NOT the real Meta webhook envelope). Tenant is carried in the body.
+      required: [tenantId, from, body]
+      properties:
+        tenantId: { type: string, minLength: 1 }
+        from: { type: string, minLength: 1, description: "Sender WhatsApp phone number." }
+        body: { type: string, minLength: 1, description: "Message text." }
+
+    WebhookAck:
+      type: object
+      required: [status]
+      properties:
+        status: { type: string, example: ACK }
+
+    SessionResponse:
+      type: object
+      required: [id, waPhoneNumber, state, contextJson, lastMessageAt, createdAt]
+      properties:
+        id: { type: string }
+        waPhoneNumber: { type: string }
+        state: { $ref: '#/components/schemas/ConversationState' }
+        contextJson: { type: string, description: "Serialized SessionContext (opaque JSON string)." }
+        lastMessageAt: { type: string, format: date-time }
+        createdAt: { type: string, format: date-time }
+
+    NotificationResponse:
+      type: object
+      required: [id, waPhoneNumber, templateName, payload, status, createdAt]
+      properties:
+        id: { type: string }
+        waPhoneNumber: { type: string }
+        templateName: { type: string }
+        payload: { type: string }
+        status: { $ref: '#/components/schemas/NotificationStatus' }
+        createdAt: { type: string, format: date-time }
+        sentAt: { type: string, format: date-time, nullable: true }

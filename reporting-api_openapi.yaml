@@ -1,0 +1,301 @@
+openapi: 3.0.3
+info:
+  title: PSS Reporting & BI Module API
+  version: "0.3.4"
+  description: >
+    Retro-documented contract for the Reporting & BI read-side module of the
+    Aurionpro PSS platform (merged in PR #61, branch feat/reporting-bi). This spec
+    describes the endpoints as merged; it was written after the code, not before —
+    see REPORTING_DELTA_0_4_RETRO.md.
+
+    Reporting is a standalone read-side projection (deferred from Dashboard Delta
+    0.2 §11): it consumes the Order and Payments event streams and serves historical
+    summary, order drill-down, and CSV export. It calls no module synchronously and
+    owns no write path into any core module — enforced in CI by
+    tools/fitness/check_reporting_isolation.py.
+
+    Conventions (carried from the platform):
+      * Tenant context is derived from the verified bearer token (tenant claim);
+        there is no tenant path/query parameter.
+      * Errors use the problem+json model (RFC 9457) with a stable code.
+    Deviation: the export endpoint declares Idempotency-Key required but does not
+    honour it (a retry creates a new export). See README_REPORTING_CONTRACTS.md
+    "Deviations from platform conventions".
+  contact:
+    name: Aurionpro Solutions Limited — PSS Platform
+    url: https://www.aurionpro.com
+
+servers:
+  - url: https://{host}
+    description: Gateway base URL (region-specific; India regions first)
+    variables:
+      host:
+        default: api.pss.local
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Reporting
+    description: Historical booking/revenue summary and order drill-down.
+  - name: Exports
+    description: CSV export creation, status, and download.
+
+paths:
+
+  /v1/reporting/summary:
+    get:
+      tags: [Reporting]
+      operationId: getSummary
+      summary: Daily booking/revenue rollup for a date range
+      description: Tenant-scoped daily rollup between from and to (inclusive), served from the projection.
+      parameters:
+        - name: from
+          in: query
+          required: true
+          schema: { type: string, format: date }
+        - name: to
+          in: query
+          required: true
+          schema: { type: string, format: date }
+      responses:
+        '200':
+          description: Daily summary rows for the range.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/SummaryResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/reporting/orders:
+    get:
+      tags: [Reporting]
+      operationId: getOrders
+      summary: Paginated order drill-down
+      parameters:
+        - name: from
+          in: query
+          required: true
+          schema: { type: string, format: date }
+        - name: to
+          in: query
+          required: true
+          schema: { type: string, format: date }
+        - name: status
+          in: query
+          required: false
+          schema: { $ref: '#/components/schemas/OrderFactStatus' }
+        - name: page
+          in: query
+          required: false
+          schema: { type: integer, default: 0, minimum: 0 }
+        - name: size
+          in: query
+          required: false
+          schema: { type: integer, default: 20, minimum: 1 }
+      responses:
+        '200':
+          description: A page of order facts.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OrdersPageResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/reporting/exports:
+    post:
+      tags: [Exports]
+      operationId: createExport
+      summary: Create a CSV export
+      description: >
+        Enqueues an export (returned as PENDING) then generates it synchronously in-process.
+        NOTE: the Idempotency-Key header is required by the handler but not honoured — a repeated
+        key creates a new export (see README deviations).
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ExportRequest' }
+            examples:
+              bookings:
+                value: { reportType: BOOKINGS_SUMMARY, from: "2026-06-01", to: "2026-06-30" }
+      responses:
+        '201':
+          description: Export accepted (PENDING); generation runs synchronously.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ExportResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/reporting/exports/{exportId}:
+    get:
+      tags: [Exports]
+      operationId: getExport
+      summary: Export status + (stub) download URL
+      parameters:
+        - $ref: '#/components/parameters/ExportIdPath'
+      responses:
+        '200':
+          description: Export status.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ExportResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: Export id not visible to the tenant.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              examples:
+                notFound:
+                  value:
+                    type: https://errors.pss/aurionpro/reporting/not_found
+                    title: Export not found
+                    status: 404
+                    code: EXPORT_NOT_FOUND
+
+  /v1/reporting/exports/{exportId}/download:
+    get:
+      tags: [Exports]
+      operationId: downloadExport
+      summary: Download the generated CSV
+      parameters:
+        - $ref: '#/components/parameters/ExportIdPath'
+      responses:
+        '200':
+          description: The generated CSV.
+          content:
+            text/csv:
+              schema: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: Export id not visible to the tenant.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: OAuth2/OIDC bearer; the verified tenant claim is the tenant context.
+
+  parameters:
+    IdempotencyKeyHeader:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: >
+        Client-generated idempotency key. NOTE (deviation): required by the handler but not
+        currently honoured — a retry creates a new export.
+      schema: { type: string, minLength: 1 }
+    ExportIdPath:
+      name: exportId
+      in: path
+      required: true
+      schema: { type: string }
+
+  responses:
+    BadRequest:
+      description: Malformed request.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Unauthorized:
+      description: Missing or invalid bearer token.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+  schemas:
+    Problem:
+      type: object
+      description: RFC 9457 problem detail with a stable machine-readable code.
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        code:
+          type: string
+          enum: [EXPORT_NOT_FOUND]
+          description: Stable machine-readable error code.
+      required: [status, code]
+
+    OrderFactStatus:
+      type: string
+      enum: [CREATED, CONFIRMED, CANCELLED]
+
+    ReportType:
+      type: string
+      enum: [BOOKINGS_SUMMARY, ORDER_LIST]
+
+    ReportExportStatus:
+      type: string
+      enum: [PENDING, READY, FAILED]
+
+    SummaryResponse:
+      type: object
+      description: One day's booking/revenue rollup. Money is whole-currency-unit integers.
+      required: [date, bookings, revenueNet, refunds, ancillaryRevenue, cancellations]
+      properties:
+        date: { type: string, format: date }
+        bookings: { type: integer }
+        revenueNet: { type: integer, format: int64 }
+        refunds: { type: integer, format: int64 }
+        ancillaryRevenue: { type: integer, format: int64 }
+        cancellations: { type: integer }
+
+    OrderResponse:
+      type: object
+      description: One order fact (projection). origin/destination/channel are currently always null (FLAG-006).
+      required: [orderId, status, amountPaid, paxCount, occurredAt]
+      properties:
+        orderId: { type: string }
+        status: { type: string }
+        amountPaid: { type: integer, format: int64 }
+        currency: { type: string, nullable: true }
+        paxCount: { type: integer }
+        origin: { type: string, nullable: true }
+        destination: { type: string, nullable: true }
+        occurredAt: { type: string, format: date-time }
+        channel: { type: string, nullable: true }
+
+    OrdersPageResponse:
+      type: object
+      required: [content, page, size, totalElements, totalPages]
+      properties:
+        content:
+          type: array
+          items: { $ref: '#/components/schemas/OrderResponse' }
+        page: { type: integer }
+        size: { type: integer }
+        totalElements: { type: integer, format: int64 }
+        totalPages: { type: integer }
+
+    ExportRequest:
+      type: object
+      required: [reportType, from, to]
+      properties:
+        reportType: { $ref: '#/components/schemas/ReportType' }
+        from: { type: string, format: date }
+        to: { type: string, format: date }
+
+    ExportResponse:
+      type: object
+      description: >
+        Export handle. status is one of PENDING/READY/FAILED. downloadUrl is a stub reference
+        (in-memory storage port in this slice).
+      required: [exportId, status]
+      properties:
+        exportId: { type: string }
+        status: { type: string, enum: [PENDING, READY, FAILED] }
+        downloadUrl: { type: string, nullable: true }

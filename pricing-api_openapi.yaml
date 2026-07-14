@@ -1,0 +1,382 @@
+openapi: 3.0.3
+info:
+  title: PSS Pricing & Fares Module API
+  version: "1.0.0-draft"
+  description: >
+    API for the Pricing & Fares module of the Aurionpro PSS platform. Pricing turns an
+    itinerary into a deterministic, reproducible, time-bounded PriceQuote. This contract
+    realises the operations in the Pricing Module Low-Level Design (§8).
+
+    Conventions:
+      * Tenant context is derived from the verified bearer token (tenant claim); there is
+        no tenant path/query parameter. A request without tenant context is rejected.
+      * Operations are read-style and deterministic: identical inputs plus the same
+        fareDataVersion always produce an identical quote, so no Idempotency-Key is needed.
+      * A request may be rejected with 409 if reference fare data changed under a concurrent
+        filing load during the request (retry).
+      * Errors use the problem+json model (RFC 9457).
+
+    Provisional choices pending residual decisions (Pricing LLD §16): quote validity window,
+    currency rounding rules, FX refresh cadence. These are marked PROVISIONAL.
+  contact:
+    name: Aurionpro Solutions Limited — PSS Platform
+    url: https://www.aurionpro.com
+
+servers:
+  - url: https://{host}
+    description: Gateway base URL (region-specific; India regions first)
+    variables:
+      host:
+        default: api.pss.local
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Pricing
+    description: Price an itinerary and reprice on change.
+  - name: Taxes
+    description: Compute the tax/fee breakdown for an itinerary.
+  - name: Fares
+    description: Read fare rules.
+
+paths:
+  /v1/price:
+    post:
+      tags: [Pricing]
+      operationId: priceItinerary
+      summary: Price an itinerary
+      description: >
+        Runs the deterministic pricing pipeline (fare selection, rule application, base fare,
+        taxes and surcharges, FX and rounding) and returns an immutable, versioned,
+        time-bounded PriceQuote. Used by Offer at shopping time and by Order to re-validate.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PriceRequest'
+            examples:
+              one-adult-blr-bom:
+                summary: One adult, BLR→BOM, India point of sale
+                value:
+                  itinerary:
+                    segments:
+                      - flightInventoryId: 01HZX3K7Qn8r2m9c4ts6v0b1aa
+                        origin: BLR
+                        destination: BOM
+                        cabin: Y
+                        rbd: B
+                        departure: "2026-07-15T06:10:00+05:30"
+                  passengers: [{ ptc: ADT, count: 1 }]
+                  pointOfSale: { country: IN, currency: INR, channel: WEB }
+      responses:
+        '200':
+          description: A priced, time-bounded quote.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PriceQuote'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+
+  /v1/price/reprice:
+    post:
+      tags: [Pricing]
+      operationId: reprice
+      summary: Reprice an order under a proposed change
+      description: >
+        Recomputes the price for an existing order under a change (add / cancel / exchange)
+        and returns the new quote plus the difference (fare difference + change penalty),
+        as an additional collection, a refund, or an even exchange.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RepriceRequest'
+            examples:
+              add-bag:
+                summary: Add a checked bag to an existing order
+                value:
+                  orderId: 01HZXBQ8M0w7k2r5t9c3v1b6dd
+                  change:
+                    operation: ADD_ITEM
+                    item: { type: ANCILLARY, productRef: BAG_20KG, passengerRef: P1 }
+      responses:
+        '200':
+          description: New quote reference and the computed difference.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RepriceResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+
+  /v1/taxes:
+    post:
+      tags: [Taxes]
+      operationId: quoteTaxes
+      summary: Compute the tax/fee breakdown for an itinerary
+      description: >
+        Returns the itemised taxes, fees and carrier surcharges (including GST for India)
+        for an itinerary, where only the tax breakdown is needed.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PriceRequest'
+      responses:
+        '200':
+          description: Per-passenger tax breakdown.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaxQuote'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+
+  /v1/fares/{fareBasis}/rules:
+    get:
+      tags: [Fares]
+      operationId: getFareRules
+      summary: Get a summary of the rules for a fare
+      parameters:
+        - $ref: '#/components/parameters/FareBasisPath'
+      responses:
+        '200':
+          description: Rule summary for the fare basis.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FareRules'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >
+        OAuth2/OIDC access token. The tenant is taken from a verified claim in the token;
+        there is no tenant path or query parameter. RBAC/ABAC is enforced per operation.
+
+  parameters:
+    FareBasisPath:
+      name: fareBasis
+      in: path
+      required: true
+      description: Fare basis code (e.g. BL1XIN).
+      schema: { type: string }
+
+  responses:
+    BadRequest:
+      description: Validation failure (malformed itinerary, unknown PTC).
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Unauthorized:
+      description: Missing or invalid authorisation / tenant context.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Forbidden:
+      description: Authenticated but not permitted for this operation or tenant.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    NotFound:
+      description: Order, quote or fare not visible to the tenant.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Conflict:
+      description: Fare data changed under a concurrent filing load during the request (retry).
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Unprocessable:
+      description: No applicable fare for the itinerary, or the change is not permitted by fare rules.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+  schemas:
+    Ulid:
+      type: string
+      description: ULID identifier.
+    Currency:
+      type: string
+      pattern: '^[A-Z]{3}$'
+      description: ISO-4217 currency code.
+    PassengerCount:
+      type: object
+      required: [ptc, count]
+      properties:
+        ptc: { type: string, enum: [ADT, CHD, INF] }
+        count: { type: integer, minimum: 1, maximum: 9 }
+    PointOfSale:
+      type: object
+      required: [country, currency]
+      properties:
+        country: { type: string, description: 'ISO-3166 alpha-2 selling country.' }
+        currency: { $ref: '#/components/schemas/Currency' }
+        channel: { type: string, enum: [WEB, MOBILE, AGENT, API] }
+    Segment:
+      type: object
+      required: [origin, destination, cabin, rbd]
+      properties:
+        flightInventoryId: { $ref: '#/components/schemas/Ulid' }
+        origin: { type: string }
+        destination: { type: string }
+        cabin: { type: string }
+        rbd: { type: string }
+        departure: { type: string, format: date-time }
+    Itinerary:
+      type: object
+      required: [segments]
+      properties:
+        segments:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/Segment' }
+    PriceRequest:
+      type: object
+      required: [itinerary, passengers, pointOfSale]
+      properties:
+        itinerary: { $ref: '#/components/schemas/Itinerary' }
+        passengers:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/PassengerCount' }
+        pointOfSale: { $ref: '#/components/schemas/PointOfSale' }
+    TaxLine:
+      type: object
+      required: [code, amount]
+      properties:
+        code: { type: string, description: 'Tax/fee/surcharge code (e.g. GST, YR).' }
+        amount: { type: number }
+    PerPassengerPrice:
+      type: object
+      required: [ptc, baseFare, total]
+      properties:
+        ptc: { type: string, enum: [ADT, CHD, INF] }
+        baseFare: { type: number }
+        taxes:
+          type: array
+          items: { $ref: '#/components/schemas/TaxLine' }
+        total: { type: number }
+    PerPassengerTaxes:
+      type: object
+      required: [ptc, taxes]
+      properties:
+        ptc: { type: string, enum: [ADT, CHD, INF] }
+        taxes:
+          type: array
+          items: { $ref: '#/components/schemas/TaxLine' }
+    TaxQuote:
+      type: object
+      required: [currency, perPassenger]
+      properties:
+        currency: { $ref: '#/components/schemas/Currency' }
+        perPassenger:
+          type: array
+          items: { $ref: '#/components/schemas/PerPassengerTaxes' }
+    FareComponent:
+      type: object
+      properties:
+        fareBasis: { type: string }
+        fareId: { $ref: '#/components/schemas/Ulid' }
+        segments:
+          type: array
+          items: { type: string, description: 'O&D the component prices (e.g. BLR-BOM).' }
+        baseAmount: { type: number }
+    PriceQuote:
+      type: object
+      required: [quoteId, currency, grandTotal, validUntil, strategy, fareDataVersion]
+      properties:
+        quoteId: { $ref: '#/components/schemas/Ulid' }
+        currency: { $ref: '#/components/schemas/Currency' }
+        validUntil: { type: string, format: date-time }
+        grandTotal: { type: number }
+        perPassenger:
+          type: array
+          items: { $ref: '#/components/schemas/PerPassengerPrice' }
+        fareComponents:
+          type: array
+          items: { $ref: '#/components/schemas/FareComponent' }
+        strategy: { type: string, enum: [FILED, DYNAMIC], description: 'Pricing strategy used.' }
+        fareDataVersion: { type: string, description: 'Reference-data version the quote was computed against.' }
+    ChangeOperation:
+      type: string
+      enum: [ADD_ITEM, CANCEL_ITEM, EXCHANGE_ITEM]
+    RepriceRequest:
+      type: object
+      required: [orderId, change]
+      properties:
+        orderId: { $ref: '#/components/schemas/Ulid' }
+        change:
+          type: object
+          required: [operation]
+          properties:
+            operation: { $ref: '#/components/schemas/ChangeOperation' }
+            item:
+              type: object
+              description: The item being added/cancelled/exchanged.
+              properties:
+                type: { type: string, enum: [AIR, ANCILLARY, SERVICE] }
+                productRef: { type: string }
+                passengerRef: { type: string }
+    Difference:
+      type: object
+      required: [amount, currency, action]
+      properties:
+        fareDifference: { type: number }
+        changePenalty: { type: number }
+        amount: { type: number, description: 'Net amount; positive = collect, negative = refund.' }
+        currency: { $ref: '#/components/schemas/Currency' }
+        action: { type: string, enum: [COLLECT, REFUND, EVEN] }
+    RepriceResponse:
+      type: object
+      required: [newQuoteId, difference]
+      properties:
+        newQuoteId: { $ref: '#/components/schemas/Ulid' }
+        difference: { $ref: '#/components/schemas/Difference' }
+    FareRuleSummary:
+      type: object
+      properties:
+        category:
+          type: string
+          enum: [ADVANCE_PURCHASE, MIN_MAX_STAY, DAY_TIME, SEASONALITY, ROUTING, COMBINABILITY, CHANGES, REFUNDS]
+        summary: { type: string }
+    FareRules:
+      type: object
+      properties:
+        fareBasis: { type: string }
+        rules:
+          type: array
+          items: { $ref: '#/components/schemas/FareRuleSummary' }
+    Problem:
+      type: object
+      description: RFC 9457 problem detail.
+      required: [type, title, status]
+      properties:
+        type: { type: string, format: uri, example: 'https://errors.pss/aurionpro/pricing/no-fare' }
+        title: { type: string, example: No applicable fare }
+        status: { type: integer, example: 422 }
+        detail: { type: string, example: No filed fare matches the requested itinerary and point of sale. }
+        instance: { type: string, format: uri }
+        code: { type: string, description: 'Stable machine-readable error code.', example: PRICING_NO_FARE }

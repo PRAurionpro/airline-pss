@@ -1,0 +1,341 @@
+openapi: 3.0.3
+info:
+  title: PSS Tranche-1 Ancillary Contract Additions
+  version: 0.2.0
+  description: >
+    Contract-first artifact realising ANCILLARIES_DELTA_0.2_SEAT_BAG.md (§3, §4).
+    Three new endpoints across three module specs — kept in one delta file for review;
+    merge each path into its owning module's spec when those specs are drawn up
+    (pricing-api, offer-api, inventory-api). Conventions follow the Order API spec:
+    tenant from the verified bearer token (no tenant parameters), Idempotency-Key on
+    state-changing calls, RFC 9457 problem+json errors with stable machine-readable codes.
+
+    NOTE (Inventory hold extension): the optional `seatClaims` array on hold lines
+    (delta §5) is an additive change to the existing HoldInventory request and is
+    specified here as the SeatClaim component for reference; it belongs in the
+    Inventory module spec, not as a new endpoint.
+servers:
+  - url: https://api.pss.internal
+security:
+  - bearerAuth: []
+tags:
+  - name: pricing
+  - name: offer
+  - name: inventory
+
+paths:
+  /v1/pricing/ancillaries/quote:
+    post:
+      operationId: priceAncillaries
+      tags: [pricing]
+      summary: Price a set of ancillary selections (immutable AncillaryQuote).
+      description: >
+        Pure function of catalogue version + selections; deterministic; the air quote
+        is never re-derived (delta §3.2). Naturally idempotent — no Idempotency-Key.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PriceAncillariesRequest' }
+      responses:
+        '200':
+          description: Immutable ancillary quote.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AncillaryQuote' }
+        '422':
+          description: >
+            Unknown code, attachment-rule violation, or missing required attribute.
+            code = ANCILLARY_INVALID_SELECTION.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        default:
+          $ref: '#/components/responses/CommonError'
+
+  /v1/offers/{offerId}/ancillaries:
+    post:
+      operationId: augmentOffer
+      tags: [offer]
+      summary: Augment a journey offer with ancillary selections → new immutable offer.
+      description: >
+        Returns a NEW offer (new offerId, supersedes the input offer for the session).
+        Re-augmenting = call again on the BASE journey offer with the full new selection
+        set (delta §4.1). validUntil = min(air quote, ancillary quote).
+      parameters:
+        - $ref: '#/components/parameters/OfferId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [selections]
+              properties:
+                selections:
+                  type: array
+                  minItems: 1
+                  items: { $ref: '#/components/schemas/AncillarySelection' }
+      responses:
+        '201':
+          description: The augmented offer.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AugmentedOffer' }
+        '404':
+          description: Base offer not visible to the tenant, or evicted.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '410':
+          description: Base offer found but past validUntil (re-shop). code = OFFER_EXPIRED.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '422':
+          description: >
+            Selections reference passengers/segments not in the base offer, or fail
+            catalogue rules. code = ANCILLARY_INVALID_SELECTION.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        default:
+          $ref: '#/components/responses/CommonError'
+
+  /v1/inventory/flights/{flightId}/seats:
+    get:
+      operationId: getSeatOccupancy
+      tags: [inventory]
+      summary: Seat occupancy for a flight (claimed + confirmed seat numbers).
+      description: >
+        Read-model serve; eventually consistent (delta §4.2). The authoritative
+        uniqueness check is at hold time — a stale map costs one polite retry,
+        never an oversell. Staleness budget: open decision, ratify with Workstream E.
+      parameters:
+        - name: flightId
+          in: path
+          required: true
+          schema: { $ref: '#/components/schemas/Ulid' }
+      responses:
+        '200':
+          description: Occupied seats on the flight.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [flightId, occupiedSeats, asOf]
+                properties:
+                  flightId: { $ref: '#/components/schemas/Ulid' }
+                  occupiedSeats:
+                    type: array
+                    items: { $ref: '#/components/schemas/SeatNumber' }
+                  asOf:
+                    type: string
+                    format: date-time
+                    description: Read-model watermark (eventual consistency made visible).
+        '404':
+          description: Flight inventory not visible to the tenant.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        default:
+          $ref: '#/components/responses/CommonError'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  parameters:
+    OfferId:
+      name: offerId
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/Ulid' }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: { type: string, maxLength: 255 }
+      description: Client-generated key; duplicate submission returns the original result.
+  responses:
+    CommonError:
+      description: 400/401/403/503 per platform conventions.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+  schemas:
+    Ulid:
+      type: string
+      pattern: '^[0-9A-HJKMNP-TV-Z]{26}$'
+    Currency:
+      type: string
+      pattern: '^[A-Z]{3}$'
+    Money:
+      type: object
+      additionalProperties: false
+      required: [amount, currency]
+      properties:
+        amount: { type: number }
+        currency: { $ref: '#/components/schemas/Currency' }
+    SeatNumber:
+      type: string
+      pattern: '^[0-9]{1,2}[A-K]$'
+      description: Row + letter, e.g. 12A. No I per cabin convention.
+    AncillaryCode:
+      type: string
+      enum: [SEAT, BAG]
+      description: Tranche-1 catalogue of two (delta §2). Extending = config + enum addition.
+    AncillarySelection:
+      type: object
+      additionalProperties: false
+      required: [code, paxRef, segmentRefs]
+      properties:
+        code: { $ref: '#/components/schemas/AncillaryCode' }
+        paxRef:
+          type: string
+          description: Positional passenger reference (P1…Pn), as in the breadth delta.
+        segmentRefs:
+          type: array
+          minItems: 1
+          items: { type: string }
+          description: >
+            SEAT: exactly one segment. BAG: the segments of one direction
+            (nonstop demo ⇒ one). Attachment rules enforced server-side from catalogue.
+        attributes:
+          type: object
+          additionalProperties: false
+          properties:
+            seatNumber: { $ref: '#/components/schemas/SeatNumber' }
+          description: Required for SEAT (seatNumber); empty for BAG.
+    TaxLine:
+      type: object
+      additionalProperties: false
+      required: [code, amount]
+      properties:
+        code: { type: string, description: e.g. GST }
+        amount: { $ref: '#/components/schemas/Money' }
+    PriceAncillariesRequest:
+      type: object
+      additionalProperties: false
+      required: [currency, selections]
+      properties:
+        currency: { $ref: '#/components/schemas/Currency' }
+        selections:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/AncillarySelection' }
+    AncillaryQuoteLine:
+      type: object
+      additionalProperties: false
+      required: [selectionRef, base, taxLines, total]
+      properties:
+        selectionRef:
+          type: integer
+          minimum: 0
+          description: Index into the request's selections array.
+        base: { $ref: '#/components/schemas/Money' }
+        taxLines:
+          type: array
+          items: { $ref: '#/components/schemas/TaxLine' }
+        total: { $ref: '#/components/schemas/Money' }
+    AncillaryQuote:
+      type: object
+      additionalProperties: false
+      required: [quoteId, lines, grandTotal, validUntil]
+      properties:
+        quoteId: { $ref: '#/components/schemas/Ulid' }
+        lines:
+          type: array
+          items: { $ref: '#/components/schemas/AncillaryQuoteLine' }
+        grandTotal: { $ref: '#/components/schemas/Money' }
+        validUntil: { type: string, format: date-time }
+    OfferItem:
+      type: object
+      additionalProperties: false
+      required: [itemId, type, amount]
+      properties:
+        itemId: { $ref: '#/components/schemas/Ulid' }
+        type: { type: string, enum: [FLIGHT, ANCILLARY] }
+        productRef:
+          type: string
+          description: flightInventoryId for FLIGHT; ancillary code for ANCILLARY.
+        paxRef: { type: string }
+        segments:
+          type: array
+          items: { type: string }
+        attributes:
+          type: object
+          additionalProperties: false
+          properties:
+            seatNumber: { $ref: '#/components/schemas/SeatNumber' }
+        priceRef:
+          type: string
+          description: Into the air PriceQuote (FLIGHT) or AncillaryQuote (ANCILLARY).
+        amount: { $ref: '#/components/schemas/Money' }
+        cabin: { type: string }
+        rbd: { type: string }
+    AugmentedOffer:
+      type: object
+      additionalProperties: false
+      required: [offerId, supersedes, status, currency, grandTotal, validUntil, items]
+      properties:
+        offerId: { $ref: '#/components/schemas/Ulid' }
+        supersedes:
+          $ref: '#/components/schemas/Ulid'
+        status: { type: string, enum: [VALID] }
+        currency: { $ref: '#/components/schemas/Currency' }
+        grandTotal:
+          type: number
+          description: 'Money invariant: Σ item amounts = grandTotal (property-tested).'
+        validUntil:
+          type: string
+          format: date-time
+          description: min(air quote validUntil, ancillary quote validUntil).
+        quoteRef: { type: string, description: The air PriceQuote (unchanged). }
+        ancillaryQuoteRef: { type: string, description: The AncillaryQuote. }
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/OfferItem' }
+    SeatClaim:
+      type: object
+      additionalProperties: false
+      required: [paxRef, seatNumber]
+      properties:
+        paxRef: { type: string }
+        seatNumber: { $ref: '#/components/schemas/SeatNumber' }
+      description: >
+        ADDITIVE extension to the existing Inventory HoldInventory request: each hold
+        line gains optional `seatClaims: SeatClaim[]`. Claims succeed or fail with the
+        hold, in the same transaction; conflict ⇒ 422 code = SEAT_UNAVAILABLE naming
+        the seats; lifecycle (TTL, release, confirm) inherited from the hold (delta §5).
+    Problem:
+      type: object
+      description: RFC 9457 problem details with a stable machine-readable code.
+      required: [type, title, status, code]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        code:
+          type: string
+          enum:
+            - ANCILLARY_INVALID_SELECTION
+            - OFFER_EXPIRED
+            - SEAT_UNAVAILABLE
+            - ANCILLARY_REF_MISMATCH
+            - VALIDATION_FAILED
+            - UNAUTHORIZED
+            - FORBIDDEN
+            - NOT_FOUND
+            - CONFLICT
+            - DOWNSTREAM_UNAVAILABLE
+        conflictingSeats:
+          type: array
+          items: { $ref: '#/components/schemas/SeatNumber' }
+          description: Populated for SEAT_UNAVAILABLE.

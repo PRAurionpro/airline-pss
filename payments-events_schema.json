@@ -1,0 +1,110 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.pss/aurionpro/payments/payments-events.schema.json",
+  "title": "Payments & Settlement module domain events",
+  "description": "Published domain events for the Payments & Settlement module (Payments LLD §11). Every event shares the common envelope; the concrete event is selected by the 'type' constant. Consumers MUST be idempotent on eventId.",
+  "$defs": {
+    "Ulid": {
+      "type": "string",
+      "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$",
+      "description": "ULID identifier."
+    },
+    "Currency": {
+      "type": "string",
+      "pattern": "^[A-Z]{3}$",
+      "description": "ISO-4217 currency code."
+    },
+    "Money": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["amount", "currency"],
+      "properties": {
+        "amount": { "type": "number" },
+        "currency": { "$ref": "#/$defs/Currency" }
+      }
+    },
+    "EnvelopeBase": {
+      "type": "object",
+      "required": ["eventId", "type", "version", "tenantId", "intentId", "occurredAt"],
+      "properties": {
+        "eventId": { "$ref": "#/$defs/Ulid", "description": "Unique event id; idempotency key for consumers." },
+        "type": { "type": "string", "description": "Event type discriminator." },
+        "version": { "type": "integer", "minimum": 1, "description": "Schema version of this event type." },
+        "tenantId": { "type": "string", "description": "Owning tenant." },
+        "intentId": { "$ref": "#/$defs/Ulid", "description": "The payment intent this event concerns." },
+        "orderId": { "$ref": "#/$defs/Ulid" },
+        "occurredAt": { "type": "string", "format": "date-time" },
+        "correlationId": { "type": "string", "description": "End-to-end correlation id for tracing." },
+        "causationId": { "type": "string", "description": "Id of the command/event that caused this one." }
+      }
+    },
+    "PaymentAuthorised": {
+      "allOf": [{ "$ref": "#/$defs/EnvelopeBase" }],
+      "required": ["payload"],
+      "properties": {
+        "type": { "const": "PaymentAuthorised" },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["amount"],
+          "properties": {
+            "amount": { "$ref": "#/$defs/Money" }
+          }
+        }
+      }
+    },
+    "PaymentSettled": {
+      "allOf": [{ "$ref": "#/$defs/EnvelopeBase" }],
+      "required": ["payload"],
+      "properties": {
+        "type": { "const": "PaymentSettled" },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["capturedAmount", "method"],
+          "properties": {
+            "capturedAmount": { "type": "number" },
+            "method": { "type": "string", "enum": ["UPI", "RUPAY", "CARD", "NETBANKING"] }
+          }
+        }
+      }
+    },
+    "PaymentFailed": {
+      "allOf": [{ "$ref": "#/$defs/EnvelopeBase" }],
+      "required": ["payload"],
+      "properties": {
+        "type": { "const": "PaymentFailed" },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["reason"],
+          "properties": {
+            "reason": { "type": "string", "enum": ["DECLINED", "ERROR", "FRAUD_DENIED", "EXPIRED"] }
+          }
+        }
+      }
+    },
+    "RefundIssued": {
+      "allOf": [{ "$ref": "#/$defs/EnvelopeBase" }],
+      "required": ["payload"],
+      "properties": {
+        "type": { "const": "RefundIssued" },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["refundId", "amount"],
+          "properties": {
+            "refundId": { "$ref": "#/$defs/Ulid" },
+            "amount": { "$ref": "#/$defs/Money" }
+          }
+        }
+      }
+    }
+  },
+  "oneOf": [
+    { "$ref": "#/$defs/PaymentAuthorised" },
+    { "$ref": "#/$defs/PaymentSettled" },
+    { "$ref": "#/$defs/PaymentFailed" },
+    { "$ref": "#/$defs/RefundIssued" }
+  ]
+}

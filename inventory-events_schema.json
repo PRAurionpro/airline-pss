@@ -1,0 +1,129 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.pss/aurionpro/inventory/inventory-events.schema.json",
+  "title": "Inventory module domain events",
+  "description": "Published domain events for the Inventory & Availability module (Inventory LLD §7). The published event types are HoldCreated, HoldConfirmed, HoldReleased, HoldExpired and AvailabilityChanged. HoldExpired is its own event — a hold's TTL elapsing and returning its seats — distinct from HoldReleased, which is an explicit release (saga compensation / cancellation / manual). Every event shares the common envelope; the concrete event is selected by the 'type' constant. Consumers MUST be idempotent on eventId.",
+  "$defs": {
+    "Ulid": {
+      "type": "string",
+      "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$",
+      "description": "ULID identifier."
+    },
+    "EnvelopeBase": {
+      "type": "object",
+      "required": ["eventId", "type", "version", "tenantId", "occurredAt"],
+      "properties": {
+        "eventId": { "$ref": "#/$defs/Ulid", "description": "Unique event id; idempotency key for consumers." },
+        "type": { "type": "string", "description": "Event type discriminator." },
+        "version": { "type": "integer", "minimum": 1, "description": "Schema version of this event type." },
+        "tenantId": { "type": "string", "description": "Owning tenant." },
+        "occurredAt": { "type": "string", "format": "date-time" },
+        "correlationId": { "type": "string", "description": "End-to-end correlation id for tracing." },
+        "causationId": { "type": "string", "description": "Id of the command/event that caused this one." }
+      }
+    },
+    "HoldItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["flightInventoryId", "rbd", "quantity"],
+      "properties": {
+        "flightInventoryId": { "$ref": "#/$defs/Ulid" },
+        "rbd": { "type": "string" },
+        "quantity": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "HoldCreated": {
+      "allOf": [{ "$ref": "#/$defs/EnvelopeBase" }],
+      "required": ["payload"],
+      "properties": {
+        "type": { "const": "HoldCreated" },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["holdId", "items", "expiresAt"],
+          "properties": {
+            "holdId": { "$ref": "#/$defs/Ulid" },
+            "orderId": { "$ref": "#/$defs/Ulid", "description": "Order this hold is for, when created by the Order saga. Carried in the payload (self-describing); also the partition key for hold events." },
+            "items": { "type": "array", "items": { "$ref": "#/$defs/HoldItem" } },
+            "expiresAt": { "type": "string", "format": "date-time" }
+          }
+        }
+      }
+    },
+    "HoldConfirmed": {
+      "allOf": [{ "$ref": "#/$defs/EnvelopeBase" }],
+      "required": ["payload"],
+      "properties": {
+        "type": { "const": "HoldConfirmed" },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["holdId"],
+          "properties": {
+            "holdId": { "$ref": "#/$defs/Ulid" },
+            "orderId": { "$ref": "#/$defs/Ulid", "description": "Order this hold is for; partition key for hold events." },
+            "items": { "type": "array", "items": { "$ref": "#/$defs/HoldItem" } }
+          }
+        }
+      }
+    },
+    "HoldReleased": {
+      "allOf": [{ "$ref": "#/$defs/EnvelopeBase" }],
+      "required": ["payload"],
+      "properties": {
+        "type": { "const": "HoldReleased" },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["holdId", "reason"],
+          "properties": {
+            "holdId": { "$ref": "#/$defs/Ulid" },
+            "orderId": { "$ref": "#/$defs/Ulid", "description": "Order this hold is for; partition key for hold events." },
+            "reason": { "type": "string", "enum": ["COMPENSATION", "CANCELLED", "MANUAL", "OTHER"] }
+          }
+        }
+      }
+    },
+    "HoldExpired": {
+      "allOf": [{ "$ref": "#/$defs/EnvelopeBase" }],
+      "required": ["payload"],
+      "properties": {
+        "type": { "const": "HoldExpired" },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["holdId"],
+          "properties": {
+            "holdId": { "$ref": "#/$defs/Ulid" },
+            "orderId": { "$ref": "#/$defs/Ulid", "description": "Order this hold is for; partition key for hold events." }
+          }
+        }
+      }
+    },
+    "AvailabilityChanged": {
+      "allOf": [{ "$ref": "#/$defs/EnvelopeBase" }],
+      "required": ["payload"],
+      "properties": {
+        "type": { "const": "AvailabilityChanged" },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["flightInventoryId", "rbd", "availableSeats"],
+          "properties": {
+            "flightInventoryId": { "$ref": "#/$defs/Ulid" },
+            "rbd": { "type": "string" },
+            "availableSeats": { "type": "integer", "minimum": 0 },
+            "status": { "type": "string", "enum": ["OPEN", "WAITLIST", "CLOSED"] }
+          }
+        }
+      }
+    }
+  },
+  "oneOf": [
+    { "$ref": "#/$defs/HoldCreated" },
+    { "$ref": "#/$defs/HoldConfirmed" },
+    { "$ref": "#/$defs/HoldReleased" },
+    { "$ref": "#/$defs/HoldExpired" },
+    { "$ref": "#/$defs/AvailabilityChanged" }
+  ]
+}

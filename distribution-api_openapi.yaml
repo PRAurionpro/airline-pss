@@ -1,0 +1,647 @@
+openapi: 3.0.3
+info:
+  title: PSS Distribution / NDC Module API
+  version: "0.1.0-draft"
+  description: >
+    NDC distribution + seller-management API for the Aurionpro PSS platform.
+    This contract documents the distribution-service **as merged** (NDC Delta 0.3
+    §3/§4 seller management, §6 NDC AirShopping/OfferPrice/OrderCreate/OrderRetrieve).
+    It is authored for EXACT fidelity to the Kotlin controllers — where the code
+    diverges from platform conventions, the divergence is documented here and in the
+    companion README's `## Deviations` section rather than normalised away.
+
+    Two controllers, seven HTTP endpoints:
+      * DistributionController — seller management (airline-staff only): register,
+        list, get seller.
+      * NdcController — NDC seller-facing surface (IATA-21.3-shaped): AirShopping,
+        OfferPrice, OrderCreate, OrderRetrieve.
+
+    Conventions (as implemented):
+      * Tenant context is derived from the verified bearer token (paved-road tenant
+        filter → TenantContextHolder.requireTenantId()); there is NO tenant path,
+        query or header parameter. If no tenant is bound the paved road throws
+        TenantContextMissingException, which neither controller catches → a
+        framework 500 (see Deviations).
+      * The seller principal on all four NDC endpoints is carried out-of-band in the
+        non-standard `X-Seller-Id` request header (a documented stand-in for an
+        upstream api-key→seller resolver), NOT a security scheme.
+      * State-changing operations take an `Idempotency-Key` header, but the semantics
+        differ per endpoint (see each operation's description): a TRUE replay key only
+        on order-create; audit-correlation-only on air-shopping/offer-price; captured
+        and IGNORED on register-seller (dedup there is a natural key on (tenant, name));
+        optional on order-retrieve.
+      * Errors are returned as a reduced problem body `{status, code, detail}` with a
+        stable machine-readable `code` — NOT full RFC 9457 (no type/title/instance)
+        and NOT served as application/problem+json (plain application/json). See the
+        Error schema.
+      * Seller resources carry an ETag (the JPA @Version), returned on register (201)
+        and get-seller (200). No `If-Match` is read on any write path.
+  contact:
+    name: Aurionpro Solutions Limited — PSS Platform
+    url: https://www.aurionpro.com
+
+servers:
+  - url: http://localhost:8084
+    description: Local distribution-service (server.port 8084)
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Sellers
+    description: Seller management (airline-staff only) — register, list, get NDC sellers.
+  - name: NDC
+    description: NDC seller-facing surface — AirShopping, OfferPrice, OrderCreate, OrderRetrieve.
+
+paths:
+
+  # ── Seller management (DistributionController) ─────────────────────────────────
+
+  /v1/sellers:
+    post:
+      tags: [Sellers]
+      operationId: registerSeller
+      summary: Register an NDC seller
+      description: >
+        Registers a seller (OTA / TMC / aggregator / direct-API partner) for the
+        caller's tenant, opening it in ACTIVE status with a secret-store apiKeyRef
+        handle. Tenant comes from the token.
+
+        Idempotency: the `Idempotency-Key` header is REQUIRED by the method signature
+        but is captured and NEVER consulted. Deduplication is a NATURAL KEY on
+        (tenantId, name): re-registering a seller with an existing name for the tenant
+        returns the original SellerProfile (still HTTP 201).
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterSellerRequest'
+            examples:
+              register-ota:
+                summary: Register an OTA seller
+                value:
+                  name: "Acme Travel"
+                  kind: "OTA"
+      responses:
+        '201':
+          description: >
+            Seller registered (or the existing seller returned, when a seller with the
+            same name already exists for the tenant).
+          headers:
+            ETag:
+              description: The seller's optimistic-lock version, as a string. Not validated on any write.
+              schema: { type: string }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SellerResponse'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '500':
+          $ref: '#/components/responses/TenantMissing'
+
+    get:
+      tags: [Sellers]
+      operationId: listSellers
+      summary: List the tenant's sellers
+      description: >
+        Returns all sellers for the caller's tenant, oldest-first. Bare JSON array —
+        no ETag, no envelope.
+      responses:
+        '200':
+          description: Sellers for the tenant (bare array).
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/SellerResponse'
+        '500':
+          $ref: '#/components/responses/TenantMissing'
+
+  /v1/sellers/{sellerId}:
+    get:
+      tags: [Sellers]
+      operationId: getSeller
+      summary: Get a seller by id
+      parameters:
+        - $ref: '#/components/parameters/SellerIdPath'
+      responses:
+        '200':
+          description: Seller found.
+          headers:
+            ETag:
+              description: The seller's optimistic-lock version, as a string. Not validated on any write.
+              schema: { type: string }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SellerResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/TenantMissing'
+
+  # ── NDC surface (NdcController) ────────────────────────────────────────────────
+
+  /v1/ndc/air-shopping:
+    post:
+      tags: [NDC]
+      operationId: airShopping
+      summary: AirShopping — request offers
+      description: >
+        IATA-21.3-shaped AirShopping. Creates a seller session and returns priced
+        offers. Both the inbound request and the outbound response are written to the
+        distribution message audit log, correlated by the `Idempotency-Key`.
+
+        Idempotency: `Idempotency-Key` is REQUIRED but is used ONLY as the audit
+        correlationId — it is NOT a replay key. Repeat calls re-execute and create a
+        new session each time.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+        - $ref: '#/components/parameters/SellerIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AirShoppingRq'
+            examples:
+              del-bom:
+                summary: One-way DEL→BOM, one adult
+                value:
+                  originDestinations:
+                    - origin: "DEL"
+                      destination: "BOM"
+                      departureDate: "2026-08-01"
+                  passengers:
+                    - ptc: "ADT"
+                      count: 1
+                  pointOfSale:
+                    country: "IN"
+                    currency: "INR"
+      responses:
+        '200':
+          description: Offers for the session.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AirShoppingRs'
+        '403':
+          $ref: '#/components/responses/SellerSuspended'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/InvalidRequest'
+        '500':
+          $ref: '#/components/responses/TenantMissing'
+
+  /v1/ndc/offer-price:
+    post:
+      tags: [NDC]
+      operationId: offerPrice
+      summary: OfferPrice — reprice a selected offer
+      description: >
+        Reprices a previously returned offer within its session and transitions the
+        session to OFFER_SELECTED. Request and response are audit-logged, correlated
+        by `Idempotency-Key`.
+
+        Idempotency: `Idempotency-Key` is REQUIRED but is audit-correlation-only, NOT
+        a replay key.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+        - $ref: '#/components/parameters/SellerIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OfferPriceRq'
+            examples:
+              price-offer:
+                value:
+                  sessionId: "01HZX8N4S0SESSIONABCDEFGHJ"
+                  offerId: "01HZX8N4S0OFFERABCDEFGHJKM"
+      responses:
+        '200':
+          description: Repriced offer.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OfferPriceRs'
+        '403':
+          $ref: '#/components/responses/SellerSuspended'
+        '404':
+          $ref: '#/components/responses/OfferOrSellerNotFound'
+        '410':
+          $ref: '#/components/responses/OfferExpired'
+        '500':
+          $ref: '#/components/responses/TenantMissing'
+
+  /v1/ndc/order-create:
+    post:
+      tags: [NDC]
+      operationId: orderCreate
+      summary: OrderCreate — create an order from a selected offer
+      description: >
+        Creates an order from an OFFER_SELECTED session, transitions the session to
+        ORDER_CREATED, and publishes a `DistributionOrderCreated` event via the
+        transactional outbox (see distribution-events_schema.json). Request and
+        response are audit-logged.
+
+        Idempotency: `Idempotency-Key` is REQUIRED and is a TRUE replay key. A repeat
+        with the same (tenantId, sellerId, key) returns the original OrderCreateRs
+        (HTTP 200) without re-calling order-service and without emitting a second
+        event.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+        - $ref: '#/components/parameters/SellerIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OrderCreateRq'
+            examples:
+              create-order:
+                value:
+                  sessionId: "01HZX8N4S0SESSIONABCDEFGHJ"
+                  offerId: "01HZX8N4S0OFFERABCDEFGHJKM"
+                  contactEmail: "jamie.doe@example.com"
+                  sellerRef: "PNR-ACME-001"
+                  passengers:
+                    - paxRef: "PAX1"
+                      ptc: "ADT"
+                      givenName: "Jamie"
+                      surname: "Doe"
+                      dateOfBirth: "1990-05-01"
+      responses:
+        '200':
+          description: Order created (or the original response replayed on an idempotent repeat).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderCreateRs'
+        '403':
+          $ref: '#/components/responses/SellerSuspended'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/SessionNotInOfferSelected'
+        '410':
+          $ref: '#/components/responses/OfferExpired'
+        '422':
+          $ref: '#/components/responses/OrderCreateFailed'
+        '500':
+          $ref: '#/components/responses/TenantMissing'
+
+  /v1/ndc/orders/{orderRef}:
+    get:
+      tags: [NDC]
+      operationId: orderRetrieve
+      summary: OrderRetrieve — read an order by reference
+      description: >
+        Retrieves an order for the (tenantId, sellerId) principal (seller-isolated
+        lookup). Request and response are audit-logged.
+
+        Idempotency: `Idempotency-Key` is OPTIONAL here; when absent, `orderRef` is
+        used as the audit correlationId.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyHeaderOptional'
+        - $ref: '#/components/parameters/SellerIdHeader'
+        - $ref: '#/components/parameters/OrderRefPath'
+      responses:
+        '200':
+          description: Order detail.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderRetrieveRs'
+        '404':
+          $ref: '#/components/responses/OrderNotFound'
+        '500':
+          $ref: '#/components/responses/TenantMissing'
+
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >
+        OAuth2/OIDC access token (prod profile: JWT resource server; non-prod:
+        permitAll demo posture, unsigned bearer). The tenant is taken from a verified
+        claim in the token via the paved-road tenant filter; there is no tenant path,
+        query or header parameter. NOTE: the NDC seller principal is NOT part of this
+        scheme — it is the separate `X-Seller-Id` header (see Deviations).
+
+  parameters:
+    SellerIdPath:
+      name: sellerId
+      in: path
+      required: true
+      description: Seller identifier (ULID).
+      schema: { type: string }
+    OrderRefPath:
+      name: orderRef
+      in: path
+      required: true
+      description: Order reference (seller-isolated).
+      schema: { type: string }
+    IdempotencyKeyHeader:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: >
+        Required by the endpoint signature. Semantics vary by endpoint — see the
+        operation description: true replay key on order-create; audit-correlation-only
+        on air-shopping/offer-price; captured-and-ignored on register-seller.
+      schema: { type: string }
+    IdempotencyKeyHeaderOptional:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: >
+        Optional on order-retrieve; when absent the path `orderRef` is used as the
+        audit correlationId.
+      schema: { type: string }
+    SellerIdHeader:
+      name: X-Seller-Id
+      in: header
+      required: true
+      description: >
+        The seller principal, carried out-of-band from the token. Non-standard header;
+        a documented stand-in for an upstream api-key→seller resolver. REQUIRED on all
+        four NDC endpoints; every NDC read/write is scoped by (tenantId, sellerId).
+      schema: { type: string }
+
+  responses:
+    NotFound:
+      description: Seller not found (NOT_FOUND).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          examples:
+            not-found:
+              value: { status: 404, code: "NOT_FOUND", detail: "Seller 01HZX... not found" }
+    UnprocessableEntity:
+      description: >
+        Generic unprocessable state on a seller endpoint. NOTE: the seller controller's
+        generic handler collapses any non-NotFound DistributionException to 422,
+        ignoring the exception's own httpStatus (register itself raises none in practice).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    InvalidRequest:
+      description: Invalid request (INVALID_REQUEST) — e.g. AirShopping with no originDestination.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          examples:
+            invalid:
+              value: { status: 422, code: "INVALID_REQUEST", detail: "at least one originDestination is required" }
+    SellerSuspended:
+      description: Seller is not ACTIVE (SELLER_SUSPENDED).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          examples:
+            suspended:
+              value: { status: 403, code: "SELLER_SUSPENDED", detail: "Seller is suspended" }
+    OfferExpired:
+      description: Offer past its validUntil (OFFER_EXPIRED).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          examples:
+            expired:
+              value: { status: 410, code: "OFFER_EXPIRED", detail: "Offer has expired" }
+    OfferOrSellerNotFound:
+      description: >
+        Seller not found (NOT_FOUND) or session not this seller's (OFFER_NOT_FOUND).
+        Both map to HTTP 404.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          examples:
+            offer-not-found:
+              value: { status: 404, code: "OFFER_NOT_FOUND", detail: "Offer/session not found for seller" }
+            seller-not-found:
+              value: { status: 404, code: "NOT_FOUND", detail: "Seller not found" }
+    OrderNotFound:
+      description: Order not found for the (tenant, seller) principal (ORDER_NOT_FOUND).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          examples:
+            order-not-found:
+              value: { status: 404, code: "ORDER_NOT_FOUND", detail: "Order not found" }
+    SessionNotInOfferSelected:
+      description: Session is not in OFFER_SELECTED state (SESSION_NOT_IN_OFFER_SELECTED).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          examples:
+            wrong-state:
+              value: { status: 409, code: "SESSION_NOT_IN_OFFER_SELECTED", detail: "Session is not in OFFER_SELECTED state" }
+    OrderCreateFailed:
+      description: order-service returned a 4xx during OrderCreate (ORDER_CREATE_FAILED).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          examples:
+            create-failed:
+              value: { status: 422, code: "ORDER_CREATE_FAILED", detail: "order-service rejected the order" }
+    TenantMissing:
+      description: >
+        No tenant bound to the request. TenantContextMissingException is not caught by
+        either controller, so it surfaces as a framework 500 (NOT a problem body). Shown
+        here for completeness; the body is the framework default, not the Error schema.
+
+  schemas:
+
+    Error:
+      type: object
+      description: >
+        The reduced problem body used by both controllers. NOT RFC 9457 (no
+        type/title/instance) and served as application/json, not application/problem+json.
+      required: [status, code]
+      properties:
+        status: { type: integer, description: "HTTP status, echoed in the body.", example: 404 }
+        code:   { type: string, description: "Stable machine-readable error code.", example: "NOT_FOUND" }
+        detail: { type: string, nullable: true, description: "Human-readable message (the exception message; may be null)." }
+
+    SellerKind:
+      type: string
+      enum: [OTA, TMC, AGGREGATOR, DIRECT_API]
+      description: Seller category.
+
+    SellerStatus:
+      type: string
+      enum: [ACTIVE, SUSPENDED]
+      description: Seller lifecycle status (surfaced as a name string on SellerResponse.status).
+
+    RegisterSellerRequest:
+      type: object
+      required: [name, kind]
+      properties:
+        name: { type: string }
+        kind: { $ref: '#/components/schemas/SellerKind' }
+
+    SellerResponse:
+      type: object
+      required: [sellerId, tenantId, name, kind, status, apiKeyRef, version, createdAt]
+      properties:
+        sellerId:  { type: string }
+        tenantId:  { type: string }
+        name:      { type: string }
+        kind:      { type: string, description: "SellerKind name (OTA / TMC / AGGREGATOR / DIRECT_API)." }
+        status:    { type: string, description: "SellerStatus name (ACTIVE / SUSPENDED)." }
+        apiKeyRef: { type: string, description: "Secret-store handle — never the api-key value itself." }
+        version:   { type: integer, format: int64, description: "JPA @Version; mirrored in the ETag header." }
+        createdAt: { type: string, format: date-time }
+
+    # ── NDC request/response DTOs (IATA 21.3 field names) ──
+
+    OriginDestination:
+      type: object
+      required: [origin, destination, departureDate]
+      properties:
+        origin:        { type: string }
+        destination:   { type: string }
+        departureDate: { type: string, description: "Departure date (string as sent; e.g. YYYY-MM-DD)." }
+
+    PaxRq:
+      type: object
+      required: [ptc, count]
+      properties:
+        ptc:   { type: string, description: "Passenger type code (e.g. ADT)." }
+        count: { type: integer }
+
+    PointOfSaleRq:
+      type: object
+      required: [country, currency]
+      properties:
+        country:  { type: string }
+        currency: { type: string }
+
+    AirShoppingRq:
+      type: object
+      required: [originDestinations, passengers, pointOfSale]
+      properties:
+        originDestinations:
+          type: array
+          items: { $ref: '#/components/schemas/OriginDestination' }
+        passengers:
+          type: array
+          items: { $ref: '#/components/schemas/PaxRq' }
+        pointOfSale: { $ref: '#/components/schemas/PointOfSaleRq' }
+
+    NdcFlight:
+      type: object
+      description: All fields nullable.
+      properties:
+        origin:      { type: string, nullable: true }
+        destination: { type: string, nullable: true }
+        departure:   { type: string, nullable: true }
+        arrival:     { type: string, nullable: true }
+        fareBasis:   { type: string, nullable: true }
+
+    NdcOffer:
+      type: object
+      required: [offerId, totalAmount, currency, validUntil, flights]
+      properties:
+        offerId:     { type: string }
+        totalAmount: { type: number, description: "BigDecimal." }
+        currency:    { type: string }
+        validUntil:  { type: string, format: date-time }
+        flights:
+          type: array
+          items: { $ref: '#/components/schemas/NdcFlight' }
+
+    AirShoppingRs:
+      type: object
+      required: [sessionId, offers]
+      properties:
+        sessionId: { type: string }
+        offers:
+          type: array
+          items: { $ref: '#/components/schemas/NdcOffer' }
+
+    OfferPriceRq:
+      type: object
+      required: [sessionId, offerId]
+      properties:
+        sessionId: { type: string }
+        offerId:   { type: string }
+
+    OfferPriceRs:
+      type: object
+      required: [sessionId, offerId, totalAmount, currency, validUntil]
+      properties:
+        sessionId:         { type: string }
+        offerId:           { type: string }
+        totalAmount:       { type: number, description: "BigDecimal." }
+        currency:          { type: string }
+        validUntil:        { type: string, format: date-time }
+        priceGuaranteeRef: { type: string, nullable: true }
+
+    NdcPaxInput:
+      type: object
+      required: [paxRef, ptc, surname]
+      properties:
+        paxRef:      { type: string }
+        ptc:         { type: string }
+        givenName:   { type: string, nullable: true }
+        surname:     { type: string }
+        dateOfBirth: { type: string, nullable: true }
+
+    OrderCreateRq:
+      type: object
+      required: [sessionId, offerId, passengers, contactEmail]
+      properties:
+        sessionId:    { type: string }
+        offerId:      { type: string }
+        passengers:
+          type: array
+          items: { $ref: '#/components/schemas/NdcPaxInput' }
+        contactEmail: { type: string }
+        sellerRef:    { type: string, nullable: true, description: "Optional seller-side reference (defaults null)." }
+
+    NdcPaxResult:
+      type: object
+      required: [paxRef]
+      properties:
+        paxRef:       { type: string }
+        ticketNumber: { type: string, nullable: true }
+
+    OrderCreateRs:
+      type: object
+      required: [orderRef, sessionId, status, totalAmount, currency, passengers]
+      properties:
+        orderRef:    { type: string }
+        sessionId:   { type: string }
+        status:      { type: string }
+        totalAmount: { type: number, description: "BigDecimal." }
+        currency:    { type: string }
+        passengers:
+          type: array
+          items: { $ref: '#/components/schemas/NdcPaxResult' }
+
+    OrderRetrieveRs:
+      type: object
+      required: [orderRef, status, totalAmount, currency, sellerId, passengers]
+      properties:
+        orderRef:    { type: string }
+        status:      { type: string }
+        totalAmount: { type: number, description: "BigDecimal." }
+        currency:    { type: string }
+        sellerId:    { type: string }
+        sellerRef:   { type: string, nullable: true }
+        passengers:
+          type: array
+          items: { $ref: '#/components/schemas/NdcPaxResult' }

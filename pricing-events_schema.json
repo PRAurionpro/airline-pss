@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.pss/aurionpro/pricing/pricing-events.schema.json",
+  "title": "Pricing & Fares module domain events",
+  "description": "Published domain events for the Pricing & Fares module (Pricing LLD §9). Every event shares the common envelope; the concrete event is selected by the 'type' constant. Consumers MUST be idempotent on eventId.",
+  "$defs": {
+    "Ulid": {
+      "type": "string",
+      "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$",
+      "description": "ULID identifier."
+    },
+    "EnvelopeBase": {
+      "type": "object",
+      "required": ["eventId", "type", "version", "tenantId", "occurredAt"],
+      "properties": {
+        "eventId": { "$ref": "#/$defs/Ulid", "description": "Unique event id; idempotency key for consumers." },
+        "type": { "type": "string", "description": "Event type discriminator." },
+        "version": { "type": "integer", "minimum": 1, "description": "Schema version of this event type." },
+        "tenantId": { "type": "string", "description": "Owning tenant." },
+        "occurredAt": { "type": "string", "format": "date-time" },
+        "correlationId": { "type": "string", "description": "End-to-end correlation id for tracing." },
+        "causationId": { "type": "string", "description": "Id of the command/event that caused this one." }
+      }
+    },
+    "FareFiled": {
+      "allOf": [{ "$ref": "#/$defs/EnvelopeBase" }],
+      "required": ["payload"],
+      "properties": {
+        "type": { "const": "FareFiled" },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["fareId", "fareBasis", "fareMarket", "fareDataVersion"],
+          "properties": {
+            "fareId": { "$ref": "#/$defs/Ulid" },
+            "fareBasis": { "type": "string" },
+            "fareMarket": { "type": "string", "description": "O&D the fare applies to." },
+            "validity": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "salesFrom": { "type": "string", "format": "date" },
+                "salesTo": { "type": "string", "format": "date" },
+                "travelFrom": { "type": "string", "format": "date" },
+                "travelTo": { "type": "string", "format": "date" }
+              }
+            },
+            "fareDataVersion": { "type": "string" }
+          }
+        }
+      }
+    },
+    "FareUpdated": {
+      "allOf": [{ "$ref": "#/$defs/EnvelopeBase" }],
+      "required": ["payload"],
+      "properties": {
+        "type": { "const": "FareUpdated" },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["fareId", "changeType", "fareDataVersion"],
+          "properties": {
+            "fareId": { "$ref": "#/$defs/Ulid" },
+            "fareBasis": { "type": "string" },
+            "changeType": { "type": "string", "enum": ["AMENDED", "WITHDRAWN", "RULE_CHANGED"] },
+            "fareDataVersion": { "type": "string" }
+          }
+        }
+      }
+    }
+  },
+  "oneOf": [
+    { "$ref": "#/$defs/FareFiled" },
+    { "$ref": "#/$defs/FareUpdated" }
+  ]
+}

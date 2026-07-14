@@ -1,0 +1,84 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: payments-alert-rules
+  namespace: observability
+  labels:
+    app: prometheus
+data:
+  payments-alerts.yml: |
+    groups:
+      - name: payments.drainer
+        interval: 60s
+        rules:
+
+          # ── Age SLO breach ────────────────────────────────────────────────────
+          # Fires when any REFUND_FAILED intent has been stuck longer than the
+          # configured ageSlo window (default 1 h).  The counter is incremented
+          # once per stuck intent per drainer cycle, so a non-zero rate means
+          # real money is owed and not recovering on its own.
+          #
+          # Severity: critical — this is money that cannot self-heal.
+          # Runbook: check REFUND_FAILED intents in the payments DB; verify PSP
+          # connectivity; escalate to on-call engineer if unresolved in 15 min.
+          - alert: RefundDrainAgeSloBreached
+            expr: |
+              increase(
+                payments_refund_drain_age_slo_breached_total[5m]
+              ) > 0
+            for: 0m
+            labels:
+              severity: critical
+              service: payments
+              team: platform
+            annotations:
+              summary: "REFUND_FAILED intent(s) older than the age SLO"
+              description: >
+                One or more PaymentIntents have been in REFUND_FAILED for longer
+                than the configured ageSlo window (default 1 h). Money is owed
+                and the drainer cannot recover it automatically.
+                Check payments DB for stuck intents and PSP connectivity.
+
+          # ── Drain cap exhausted ───────────────────────────────────────────────
+          # Fires when an intent exhausts its retry cap (default maxAttempts=5)
+          # and is left permanently in REFUND_FAILED with no further retries.
+          # Requires manual PSP-side investigation.
+          #
+          # Severity: critical — permanently stuck refund, needs human action.
+          - alert: RefundDrainCapExhausted
+            expr: |
+              increase(
+                payments_refund_drain_exhausted_total[5m]
+              ) > 0
+            for: 0m
+            labels:
+              severity: critical
+              service: payments
+              team: platform
+            annotations:
+              summary: "Refund drain cap exhausted — intent permanently stuck"
+              description: >
+                A REFUND_FAILED intent has exhausted all drain retry attempts
+                (maxAttempts). The drainer will no longer retry it. Manual
+                investigation and PSP-side action required to issue the refund.
+
+          # ── Queue depth warning ───────────────────────────────────────────────
+          # Early-warning before the age SLO fires: if the REFUND_FAILED queue
+          # is growing, the drainer may be falling behind or the PSP is degraded.
+          # Threshold matches alertThreshold=20 in PaymentsTimingProperties.
+          #
+          # Severity: warning — not yet money-at-risk but warrants investigation.
+          - alert: RefundDrainQueueDepthHigh
+            expr: |
+              refund_failed_queue_depth > 20
+            for: 5m
+            labels:
+              severity: warning
+              service: payments
+              team: platform
+            annotations:
+              summary: "REFUND_FAILED queue depth above threshold"
+              description: >
+                The REFUND_FAILED queue has been above {{ $value }} intents for
+                5 minutes. The drainer may be falling behind or the PSP is
+                degraded. Investigate before the age SLO fires.
