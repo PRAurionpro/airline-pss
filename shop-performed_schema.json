@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.pss/aurionpro/offer/shop-performed.schema.json",
+  "title": "ShopPerformed telemetry event",
+  "description": "Realises DASHBOARD_DELTA_0.2_LIVE_READSIDE.md §3. Emitted by the Offer module once per Shop call and once per CombineAndPrice, stage-tagged. TELEMETRY-GRADE: Offer is stateless/storeless, so publication is best-effort fire-and-forget (at-most-once; may be lost under failure). Consumers MUST treat funnel-top figures as directional and MUST NOT derive money figures from this event. Envelope follows the platform convention but carries searchId instead of orderId.",
+  "type": "object",
+  "required": ["eventId", "type", "version", "tenantId", "searchId", "occurredAt", "payload"],
+  "properties": {
+    "eventId": { "$ref": "#/$defs/Ulid", "description": "Idempotency key for consumers (dedupe still applies; loss may, too)." },
+    "type": { "const": "ShopPerformed" },
+    "version": { "type": "integer", "minimum": 1 },
+    "tenantId": { "type": "string" },
+    "searchId": { "$ref": "#/$defs/Ulid", "description": "Stable across the stages of one shopping journey (outbound, return, combine)." },
+    "occurredAt": { "type": "string", "format": "date-time" },
+    "correlationId": { "type": "string" },
+    "causationId": { "type": "string" },
+    "payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["origin", "destination", "tripType", "paxCount", "channel", "offersReturned", "stage"],
+      "properties": {
+        "origin": { "$ref": "#/$defs/Iata" },
+        "destination": { "$ref": "#/$defs/Iata" },
+        "tripType": { "type": "string", "enum": ["ONE_WAY", "RETURN"] },
+        "paxCount": { "type": "integer", "minimum": 1, "maximum": 9 },
+        "channel": { "type": "string", "enum": ["WEB", "MOBILE", "AGENT", "API"] },
+        "offersReturned": { "type": "integer", "minimum": 0 },
+        "stage": {
+          "type": "string",
+          "enum": ["OUTBOUND", "RETURN", "COMBINE"],
+          "description": "Funnel rule: count stage=OUTBOUND as 'searches'; sum offersReturned across stages as 'offers'. ONE_WAY journeys emit stage=OUTBOUND only."
+        }
+      }
+    }
+  },
+  "$defs": {
+    "Ulid": {
+      "type": "string",
+      "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+    },
+    "Iata": {
+      "type": "string",
+      "pattern": "^[A-Z]{3}$"
+    }
+  }
+}

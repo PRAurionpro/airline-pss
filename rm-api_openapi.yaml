@@ -1,0 +1,276 @@
+openapi: 3.0.3
+info:
+  title: PSS Revenue Management Module API
+  version: "0.3.6"
+  description: >
+    Retro-documented contract for the Revenue Management (RM) module of the
+    Aurionpro PSS platform (merged in PR #64, branch feat/revenue-management).
+    This spec describes the endpoints as merged; it was written after the code, not
+    before — see RM_DELTA_0_6_RETRO.md.
+
+    RM is an Offer/Retailing-layer module: it owns forecasting + class authorisation
+    units (AUs) and feeds Inventory one-directionally via an AdjustInventory HTTP call.
+    It never holds inventory counts; the forecast/optimisation engines are pure
+    functions behind ports (real ML deferred).
+
+    Conventions (carried from the platform):
+      * Tenant context is derived from the verified bearer token (tenant claim);
+        there is no tenant path/query parameter.
+      * Errors use the problem+json model (RFC 9457) with a stable code.
+    Deviations (see README_RM_CONTRACTS.md): every endpoint is gated by a
+    demo-posture X-Rm-Admin header (an app-level check, not a scope/filter);
+    Idempotency-Key is required on the two POSTs but not honoured; the outbound
+    AdjustInventory call carries no Idempotency-Key/retry and targets an
+    Inventory endpoint that is not currently served by inventory-service.
+  contact:
+    name: Aurionpro Solutions Limited — PSS Platform
+    url: https://www.aurionpro.com
+
+servers:
+  - url: https://{host}
+    description: Gateway base URL (region-specific; India regions first)
+    variables:
+      host:
+        default: api.pss.local
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: FlightClasses
+    description: Flight-class configuration, AU computation, and recommendation history.
+
+paths:
+
+  /v1/rm/flight-classes:
+    post:
+      tags: [FlightClasses]
+      operationId: registerFlightClass
+      summary: Register a flight-class config
+      description: Idempotent on the natural key (tenant + flightNumber + departureDate + cabin + rbd).
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+        - $ref: '#/components/parameters/RmAdminHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RegisterFlightClassRequest' }
+            examples:
+              demo:
+                value:
+                  flightNumber: "AI505"
+                  departureDate: "2026-08-01"
+                  cabin: "Y"
+                  rbd: "B"
+                  physicalCapacity: 100
+                  overbookingFactor: 1.05
+                  targetLoadFactor: 0.85
+      responses:
+        '201':
+          description: Flight-class config registered.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FlightClassConfigResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/AdminRequired' }
+    get:
+      tags: [FlightClasses]
+      operationId: listFlightClasses
+      summary: List flight-class configs (tenant-scoped)
+      parameters:
+        - $ref: '#/components/parameters/RmAdminHeader'
+      responses:
+        '200':
+          description: Flight-class configs for the tenant.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/FlightClassConfigResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/AdminRequired' }
+
+  /v1/rm/flight-classes/{id}:
+    get:
+      tags: [FlightClasses]
+      operationId: getFlightClass
+      summary: Read a flight-class config
+      parameters:
+        - $ref: '#/components/parameters/FlightClassIdPath'
+        - $ref: '#/components/parameters/RmAdminHeader'
+      responses:
+        '200':
+          description: The flight-class config.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FlightClassConfigResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/AdminRequired' }
+        '404':
+          description: Config id not visible to the tenant.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              examples:
+                notFound:
+                  value:
+                    type: https://errors.pss/aurionpro/rm/not_found
+                    title: Flight-class config not found
+                    status: 404
+                    code: FLIGHT_CLASS_CONFIG_NOT_FOUND
+
+  /v1/rm/flight-classes/{id}/compute:
+    post:
+      tags: [FlightClasses]
+      operationId: computeAu
+      summary: Compute an AU recommendation and apply it to Inventory
+      description: >
+        Runs forecast + optimisation, appends an AuRecommendation, and pushes the AU to Inventory
+        (one-directional AdjustInventory). NOTE: not idempotent despite the required Idempotency-Key —
+        each call appends a recommendation and re-calls Inventory.
+      parameters:
+        - $ref: '#/components/parameters/FlightClassIdPath'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+        - $ref: '#/components/parameters/RmAdminHeader'
+      responses:
+        '200':
+          description: The AU recommendation produced and applied.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuRecommendationResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/AdminRequired' }
+        '404':
+          description: Config id not visible to the tenant.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /v1/rm/flight-classes/{id}/recommendations:
+    get:
+      tags: [FlightClasses]
+      operationId: listRecommendations
+      summary: AU recommendation history (newest first)
+      parameters:
+        - $ref: '#/components/parameters/FlightClassIdPath'
+        - $ref: '#/components/parameters/RmAdminHeader'
+      responses:
+        '200':
+          description: Recommendation history for the config.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/AuRecommendationResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/AdminRequired' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: OAuth2/OIDC bearer; the verified tenant claim is the tenant context.
+
+  parameters:
+    IdempotencyKeyHeader:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: "Client idempotency key. NOTE (deviation): required by the handler but not honoured on compute."
+      schema: { type: string, minLength: 1 }
+    RmAdminHeader:
+      name: X-Rm-Admin
+      in: header
+      required: false
+      description: >
+        Demo-posture admin gate (app-level, not a security filter). Must be literally true or the
+        request is rejected with 403 RM_ADMIN_REQUIRED.
+      schema: { type: boolean }
+    FlightClassIdPath:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+
+  responses:
+    BadRequest:
+      description: Malformed request.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Unauthorized:
+      description: Missing or invalid bearer token.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    AdminRequired:
+      description: X-Rm-Admin not present/true.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          examples:
+            adminRequired:
+              value:
+                type: https://errors.pss/aurionpro/rm/forbidden
+                title: RM admin required
+                status: 403
+                code: RM_ADMIN_REQUIRED
+
+  schemas:
+    Problem:
+      type: object
+      description: RFC 9457 problem detail with a stable machine-readable code.
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        code:
+          type: string
+          enum: [FLIGHT_CLASS_CONFIG_NOT_FOUND, RM_ADMIN_REQUIRED]
+      required: [status, code]
+
+    RegisterFlightClassRequest:
+      type: object
+      required: [flightNumber, departureDate, cabin, rbd, physicalCapacity, overbookingFactor, targetLoadFactor]
+      properties:
+        flightNumber: { type: string, minLength: 1 }
+        departureDate: { type: string, format: date }
+        cabin: { type: string, minLength: 1 }
+        rbd: { type: string, minLength: 1 }
+        physicalCapacity: { type: integer, minimum: 1 }
+        overbookingFactor: { type: number, description: "Decimal factor, e.g. 1.05." }
+        targetLoadFactor: { type: number, description: "Decimal target load factor, e.g. 0.85." }
+
+    FlightClassConfigResponse:
+      type: object
+      required: [id, flightNumber, departureDate, cabin, rbd, physicalCapacity, overbookingFactor, targetLoadFactor, active]
+      properties:
+        id: { type: string }
+        flightNumber: { type: string }
+        departureDate: { type: string, format: date }
+        cabin: { type: string }
+        rbd: { type: string }
+        physicalCapacity: { type: integer }
+        overbookingFactor: { type: number }
+        targetLoadFactor: { type: number }
+        active: { type: boolean }
+
+    AuRecommendationResponse:
+      type: object
+      description: One AU recommendation. In this slice currentBookings is 0 (booking snapshot not wired).
+      required: [id, flightClassConfigId, recommendedAu, currentBookings, forecastDemand, confidence, computedAt, applied]
+      properties:
+        id: { type: string }
+        flightClassConfigId: { type: string }
+        recommendedAu: { type: integer }
+        currentBookings: { type: integer }
+        forecastDemand: { type: integer }
+        confidence: { type: number }
+        computedAt: { type: string, format: date-time }
+        applied: { type: boolean }
